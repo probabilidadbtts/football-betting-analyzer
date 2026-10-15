@@ -1,10 +1,14 @@
 """
 Motor de análisis: extrae mercados, calcula probabilidad implícita,
-aplica boosts por forma y penalizaciones por ausencias.
+aplica boosts por forma, penalizaciones por ausencias y filtro xGA.
 Solo OVERS y BTTS SÍ — sin unders.
 """
 import logging
-from .config import PROB_THRESHOLD, FORM_BOOST, ABSENCE_PENALTY
+from .config import (
+    PROB_THRESHOLD, FORM_BOOST, ABSENCE_PENALTY,
+    XGA_PENALTY_LOW, XGA_PENALTY_HIGH,
+    XGA_THRESHOLD_LOW, XGA_THRESHOLD_HIGH,
+)
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +25,22 @@ def _f(v) -> float | None:
 def _prob(odds_val) -> float | None:
     o = _f(odds_val)
     return (1.0 / o) if o and o > 1.0 else None
+
+
+# ─── Filtro xGA ─────────────────────────────────────────────────────────────
+
+def _xga_penalty(xga_value: float | None) -> float:
+    """
+    Penaliza la probabilidad BTTS si el xGA (goles esperados en contra)
+    del equipo es muy bajo → defensa sólida → BTTS improbable.
+    """
+    if xga_value is None:
+        return 0.0
+    if xga_value < XGA_THRESHOLD_LOW:
+        return XGA_PENALTY_LOW   # -12%
+    elif xga_value < XGA_THRESHOLD_HIGH:
+        return XGA_PENALTY_HIGH  # -8%
+    return 0.0
 
 
 # ─── Forma reciente ─────────────────────────────────────────────────────────
@@ -48,13 +68,13 @@ def _compute_form(matches_list: list[dict], team_id: str) -> tuple[int, int, int
 
 # ─── Detección de ausencias ─────────────────────────────────────────────────
 
-def _check_absences(lineups_data: dict, players_list: list[dict]) -> list[str]:
+def _check_absences(lineups_side: dict, players_list: list[dict]) -> list[str]:
     """Devuelve nombres de delanteros clave ausentes del XI."""
-    if not lineups_data or not players_list:
+    if not lineups_side or not players_list:
         return []
 
-    xi = lineups_data.get("starting_xi", [])
-    subs = lineups_data.get("substitutes", [])
+    xi = lineups_side.get("starting_xi", [])
+    subs = lineups_side.get("substitutes", [])
     present_ids = {p.get("player_id") or p.get("id") for p in xi + subs}
 
     forward_positions = {"ST", "CF", "LW", "RW", "FW"}
@@ -82,13 +102,23 @@ def analyze(match: dict,
     home_id = match.get("home_team", {}).get("id", "")
     away_id = match.get("away_team", {}).get("id", "")
 
-    # ── xG ──
+    # ── xG / xGA ──
     overview = st.get("overview", {}) if st else {}
     xg_data = overview.get("expected_goals", {})
     xg_all = xg_data.get("all", {}) if isinstance(xg_data, dict) else {}
+
     xg_h = _f(xg_all.get("home", 0)) or 0
     xg_a = _f(xg_all.get("away", 0)) or 0
     total_xg = xg_h + xg_a
+
+    # xGA (goles esperados EN CONTRA)
+    xga_data = xg_data.get("against", {}) if isinstance(xg_data, dict) else {}
+    xga_all = xga_data.get("all", {}) if isinstance(xga_data, dict) else {}
+    xga_h = _f(xga_all.get("home"))
+    xga_a = _f(xga_all.get("away"))
+
+    # ── Penalización xGA ──
+    xga_pen = _xga_penalty(xga_h) + _xga_penalty(xga_a)
 
     # ── Forma ──
     form_boost = 0.0
@@ -122,15 +152,15 @@ def analyze(match: dict,
             if isinstance(btts_yes, dict) else btts_yes
         p = _prob(btts_val)
         if p:
-            adj = p + form_boost - (home_penalty + away_penalty) / 2
+            adj = p + form_boost + xga_pen - (home_penalty + away_penalty) / 2
             if adj >= PROB_THRESHOLD:
                 tag = "⚠️" if (home_absent or away_absent) else "🎯"
-                label = f"{tag} BTTS SÍ  {home} vs {away}  (P≈{p:.0%})"
+                label = f"{tag} BTTS SÍ  {home} vs {away}  (P≈{adj:.0%})"
                 if home_absent:
                     label += f"  [⚡ {home_absent[0]}]"
                 if away_absent:
                     label += f"  [⚡ {away_absent[0]}]"
-                candidates.append((label, p))
+                candidates.append((label, adj))
 
         # Over 2.5 goles
         ou = markets.get("total_goals") or markets.get("over_under_25") or {}
@@ -139,10 +169,10 @@ def analyze(match: dict,
             if isinstance(ou_over, dict) else ou_over
         p = _prob(ou_val)
         if p:
-            adj = p + form_boost - (home_penalty + away_penalty) / 2
+            adj = p + form_boost + xga_pen - (home_penalty + away_penalty) / 2
             if adj >= PROB_THRESHOLD:
-                label = f"⚽ Over 2.5  {home} vs {away}  (P≈{p:.0%}, xG={total_xg:.2f})"
-                candidates.append((label, p))
+                label = f"⚽ Over 2.5  {home} vs {away}  (P≈{adj:.0%}, xG={total_xg:.2f})"
+                candidates.append((label, adj))
 
         # Over corners
         co = markets.get("corners_ou") or markets.get("corners") or {}
