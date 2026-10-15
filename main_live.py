@@ -5,14 +5,13 @@ import logging
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.config import COMPETITION_IDS, MAX_MATCHES
+from src.config import COMPETITION_IDS, MAX_MATCHES, MAX_WORKERS
 from src.api_client import matches, match_stats, match_odds_live
 from src.analyzer import analyze
 from src.telegram_bot import send
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-MAX_WORKERS = 10
 
 
 def _process_live(m: dict) -> list[str]:
