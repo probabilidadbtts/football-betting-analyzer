@@ -1,12 +1,12 @@
 """
 Orquestador pre-match: analiza TODOS los partidos del día.
-Paralelizado con ThreadPoolExecutor para no colgarse.
+Paralelizado con ThreadPoolExecutor.
 """
 import logging
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.config import COMPETITION_IDS, MAX_MATCHES
+from src.config import COMPETITION_IDS, MAX_MATCHES, MAX_WORKERS
 from src.api_client import (
     matches, match_stats, match_odds,
     match_lineups, team_players, team_recent_matches,
@@ -16,8 +16,6 @@ from src.telegram_bot import send
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-MAX_WORKERS = 10  # 10 requests en paralelo
 
 
 def _process_match(m: dict) -> list[str]:
@@ -29,11 +27,11 @@ def _process_match(m: dict) -> list[str]:
     away_id = m.get("away_team", {}).get("id", "")
 
     try:
-        # ── Llamadas principales (siempre) ──
+        # Llamadas principales
         st = match_stats(mid) if m.get("xg_available") else {}
         od = match_odds(mid)
 
-        # ── Llamadas secundarias (opcionales, no bloquean) ──
+        # Llamadas secundarias (opcionales)
         form_data = None
         try:
             form_data = {
@@ -48,13 +46,12 @@ def _process_match(m: dict) -> list[str]:
         away_players: list[dict] = []
         try:
             lineups_data = match_lineups(mid)
-            if lineups_data:  # solo si hay lineups confirmadas
+            if lineups_data:
                 home_players = team_players(home_id)
                 away_players = team_players(away_id)
         except Exception:
             pass
 
-        # ── Analizar ──
         bets = analyze(
             match=m, st=st, od=od,
             form_data=form_data,
@@ -75,7 +72,6 @@ def main():
     today = date.today().isoformat()
     log.info("═══ Análisis pre-match %s ═══", today)
 
-    # ── Obtener TODOS los partidos de hoy ──
     comp_filter = COMPETITION_IDS[0] if COMPETITION_IDS else None
     day_matches = matches(
         date_from=today, date_to=today,
@@ -87,7 +83,6 @@ def main():
     eligible = [m for m in day_matches if m.get("odds_available")]
     log.info("Con cuotas disponibles: %d", len(eligible))
 
-    # ── Procesar en paralelo ──
     all_bets: list[str] = []
     total_analyzed = 0
 
@@ -98,18 +93,17 @@ def main():
         }
         for future in as_completed(futures):
             try:
-                bets = future.result(timeout=30)  # timeout por partido
+                bets = future.result(timeout=30)
                 all_bets.extend(bets)
             except Exception as e:
                 m = futures[future]
-                log.warning("  ✗ timeout/error: %s", e)
+                log.warning("  ✗ timeout: %s", e)
             total_analyzed += 1
             if total_analyzed % 10 == 0:
                 log.info("  Progreso: %d/%d", total_analyzed, len(eligible[:MAX_MATCHES]))
 
     log.info("═══ Analizados: %d | Apuestas: %d ═══", total_analyzed, len(all_bets))
 
-    # ── Enviar a Telegram ──
     if all_bets:
         header = (
             f"🏆 <b>MEJORES OPORTUNIDADES — {today}</b>\n"
