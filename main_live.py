@@ -1,9 +1,9 @@
 """
-Orquestador en vivo: analiza partidos EN CURSO con cuotas live.
-Se ejecuta cada 30 min.
+Orquestador en vivo: analiza partidos EN CURSO. Paralelizado.
 """
 import logging
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.config import COMPETITION_IDS, MAX_MATCHES
 from src.api_client import matches, match_stats, match_odds_live
@@ -12,6 +12,18 @@ from src.telegram_bot import send
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+MAX_WORKERS = 10
+
+
+def _process_live(m: dict) -> list[str]:
+    mid = m.get("id", "?")
+    try:
+        st = match_stats(mid) if m.get("xg_available") else {}
+        od = match_odds_live(mid)
+        return analyze(match=m, st=st, od=od)
+    except Exception as e:
+        log.warning("  ✗ %s: %s", mid, e)
+        return []
 
 
 def main():
@@ -20,8 +32,7 @@ def main():
 
     comp_filter = COMPETITION_IDS[0] if COMPETITION_IDS else None
     live_matches = matches(
-        date_from=today,
-        date_to=today,
+        date_from=today, date_to=today,
         status="live",
         competition_id=comp_filter,
     )
@@ -33,20 +44,16 @@ def main():
     all_bets: list[str] = []
     total_analyzed = 0
 
-    for m in eligible[:MAX_MATCHES]:
-        mid = m.get("id")
-        if not mid:
-            continue
-        try:
-            st = match_stats(mid) if m.get("xg_available") else {}
-            od = match_odds_live(mid)
-            bets = analyze(match=m, st=st, od=od)
-            all_bets.extend(bets)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_process_live, m): m for m in eligible[:MAX_MATCHES]}
+        for future in as_completed(futures):
+            try:
+                all_bets.extend(future.result(timeout=20))
+            except Exception:
+                pass
             total_analyzed += 1
-        except Exception as e:
-            log.warning("  ⚠ %s: %s", mid, e)
 
-    log.info("Analizados: %d | Apuestas: %d", total_analyzed, len(all_bets))
+    log.info("═══ Analizados: %d | Apuestas: %d ═══", total_analyzed, len(all_bets))
 
     if all_bets:
         header = (
