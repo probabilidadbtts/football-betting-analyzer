@@ -12,14 +12,25 @@ from src.api_client import (
     match_lineups, team_players, team_recent_matches,
 )
 from src.analyzer import analyze
-from src.telegram_bot import send
+from src.telegram_bot import send_analysis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
-def _process_match(m: dict) -> list[str]:
-    """Procesa UN partido: stats + odds + form + lineups + players → apuestas."""
+def _fetch_team_context(team_id: str) -> tuple[list[dict], dict[str, dict]]:
+    """Obtiene últimos 10 partidos + stats de cada uno para un equipo."""
+    recent = team_recent_matches(team_id, 10)
+    stats_cache: dict[str, dict] = {}
+    for m in recent:
+        mid = m.get("id")
+        if mid:
+            stats_cache[mid] = match_stats(mid)
+    return recent, stats_cache
+
+
+def _process_match(m: dict) -> dict | None:
+    """Procesa UN partido completo."""
     mid = m.get("id", "?")
     home = m.get("home_team", {}).get("name", "?")
     away = m.get("away_team", {}).get("name", "?")
@@ -27,20 +38,26 @@ def _process_match(m: dict) -> list[str]:
     away_id = m.get("away_team", {}).get("id", "")
 
     try:
-        # Llamadas principales
+        # ── Llamadas principales ──
         st = match_stats(mid) if m.get("xg_available") else {}
         od = match_odds(mid)
 
-        # Llamadas secundarias (opcionales)
-        form_data = None
-        try:
-            form_data = {
-                "home": team_recent_matches(home_id, 5),
-                "away": team_recent_matches(away_id, 5),
-            }
-        except Exception:
-            pass
+        if not od or not od.get("bookmakers"):
+            return None  # Sin cuotas → no analizable
 
+        # ── Contexto de equipos (últimos 10 + stats) ──
+        home_recent, home_stats_cache = _fetch_team_context(home_id)
+        away_recent, away_stats_cache = _fetch_team_context(away_id)
+
+        # ── H2H (partidos del home donde aparece el away) ──
+        h2h = []
+        for m2 in home_recent:
+            h_id = m2.get("home_team", {}).get("id")
+            a_id = m2.get("away_team", {}).get("id")
+            if h_id == away_id or a_id == away_id:
+                h2h.append(m2)
+
+        # ── Lineups (opcionales) ──
         lineups_data = {}
         home_players: list[dict] = []
         away_players: list[dict] = []
@@ -52,26 +69,37 @@ def _process_match(m: dict) -> list[str]:
         except Exception:
             pass
 
-        bets = analyze(
+        # ── Analizar ──
+        result = analyze(
             match=m, st=st, od=od,
-            form_data=form_data,
+            home_recent=home_recent,
+            away_recent=away_recent,
+            home_stats_cache=home_stats_cache,
+            away_stats_cache=away_stats_cache,
+            h2h_matches=h2h,
             lineups_data=lineups_data,
             home_players=home_players,
             away_players=away_players,
         )
-        if bets:
-            log.info("  ✓ %s vs %s → %d apuestas", home, away, len(bets))
-        return bets
+
+        if result:
+            status = "✓" if result["filters_passed"] else "⛔"
+            log.info("  %s %s vs %s → P=%.0f%% L%d %s",
+                     status, home, away,
+                     result["p_model"] * 100, result["level"],
+                     result["filter_reasons"][0] if not result["filters_passed"] else "")
+        return result
 
     except Exception as e:
         log.warning("  ✗ %s vs %s: %s", home, away, e)
-        return []
+        return None
 
 
 def main():
     today = date.today().isoformat()
     log.info("═══ Análisis pre-match %s ═══", today)
 
+    # ── Obtener TODOS los partidos de hoy ──
     comp_filter = COMPETITION_IDS[0] if COMPETITION_IDS else None
     day_matches = matches(
         date_from=today, date_to=today,
@@ -83,39 +111,27 @@ def main():
     eligible = [m for m in day_matches if m.get("odds_available")]
     log.info("Con cuotas disponibles: %d", len(eligible))
 
-    all_bets: list[str] = []
+    # ── Procesar en paralelo ──
+    results: list[dict] = []
     total_analyzed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_process_match, m): m
-            for m in eligible[:MAX_MATCHES]
-        }
+        futures = {pool.submit(_process_match, m): m for m in eligible[:MAX_MATCHES]}
         for future in as_completed(futures):
             try:
-                bets = future.result(timeout=30)
-                all_bets.extend(bets)
+                result = future.result(timeout=60)
+                if result:
+                    results.append(result)
             except Exception as e:
-                m = futures[future]
-                log.warning("  ✗ timeout: %s", e)
+                log.warning("  ✗ timeout/error: %s", e)
             total_analyzed += 1
             if total_analyzed % 10 == 0:
-                log.info("  Progreso: %d/%d", total_analyzed, len(eligible[:MAX_MATCHES]))
+                log.info("  Progreso: %d/%d", total_analyzed, min(len(eligible), MAX_MATCHES))
 
-    log.info("═══ Analizados: %d | Apuestas: %d ═══", total_analyzed, len(all_bets))
+    log.info("═══ Analizados: %d | Con datos: %d ═══", total_analyzed, len(results))
 
-    if all_bets:
-        header = (
-            f"🏆 <b>MEJORES OPORTUNIDADES — {today}</b>\n"
-            f"📊 {total_analyzed} partidos analizados\n\n"
-        )
-        body = "\n".join(all_bets[:30])
-        msg = header + body
-        if len(msg) > 4000:
-            msg = header + body[:3900] + "\n…(truncado)"
-        send(msg)
-    else:
-        send(f"📭 Sin oportunidades por encima del umbral hoy ({today}).")
+    # ── Enviar a Telegram ──
+    send_analysis(results, today, total_analyzed)
 
 
 if __name__ == "__main__":
