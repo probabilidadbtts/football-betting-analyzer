@@ -5,11 +5,10 @@ Cliente HTTP para TheStatsAPI.
 import time
 import logging
 import requests
-from .config import API_KEY, BASE_URL, PER_PAGE
+from .config import API_KEY, BASE_URL, PER_PAGE, TIMEOUT
 
 log = logging.getLogger(__name__)
 H = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
-TIMEOUT = 10
 
 
 def _get(path: str, params: dict | None = None, retries: int = 2) -> dict:
@@ -47,7 +46,8 @@ def _get(path: str, params: dict | None = None, retries: int = 2) -> dict:
 def matches(date_from: str,
             date_to: str | None = None,
             status: str | None = None,
-            competition_id: str | None = None) -> list[dict]:
+            competition_id: str | None = None,
+            team_id: str | None = None) -> list[dict]:
     """TODOS los partidos de la fecha. Paginación automática."""
     date_to = date_to or date_from
     all_items: list[dict] = []
@@ -64,6 +64,8 @@ def matches(date_from: str,
             params["status"] = status
         if competition_id:
             params["competition_id"] = competition_id
+        if team_id:
+            params["team_id"] = team_id
 
         resp = _get("/football/matches", params)
         data = resp.get("data", [])
@@ -71,12 +73,17 @@ def matches(date_from: str,
         total_pages = meta.get("total_pages", 1)
 
         all_items.extend(data)
-
         if page >= total_pages:
             break
         page += 1
 
     return all_items
+
+
+def team_recent_matches(team_id: str, n: int = 10, status: str = "finished") -> list[dict]:
+    """Últimos N partidos terminados de un equipo."""
+    return matches(date_from="2000-01-01", date_to="2099-12-31",
+                   status=status, team_id=team_id)[:n]
 
 
 # ─── Estadísticas + xG ──────────────────────────────────────────────────────
@@ -110,19 +117,4 @@ def match_lineups(match_id: str) -> dict:
 def team_players(team_id: str) -> list[dict]:
     resp = _get(f"/football/teams/{team_id}/players")
     data = resp.get("data", [])
-    return data if isinstance(data, list) else []
-
-
-# ─── Forma reciente ─────────────────────────────────────────────────────────
-
-def team_recent_matches(team_id: str, n: int = 5) -> list[dict]:
-    """Últimos N partidos terminados de un equipo."""
-    params = {
-        "team_id": team_id,
-        "status": "finished",
-        "per_page": n,
-        "page": 1,
-    }
-    resp = _get("/football/matches", params)
-    data = resp.get("data", [])
-    return data[:n] if isinstance(data, list) else []   
+    return data if isinstance(data, list) else []   
