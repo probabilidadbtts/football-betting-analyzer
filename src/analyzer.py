@@ -1,19 +1,26 @@
 """
-Motor de análisis: extrae mercados, calcula probabilidad implícita,
-aplica boosts por forma, penalizaciones por ausencias y filtro xGA.
-Solo OVERS y BTTS SÍ — sin unders.
+Motor de análisis principal.
+Combina Poisson + cuotas + filtros + Kelly.
 """
 import logging
+from datetime import datetime, timezone
 from .config import (
-    PROB_THRESHOLD, FORM_BOOST, ABSENCE_PENALTY,
-    XGA_PENALTY_LOW, XGA_PENALTY_HIGH,
-    XGA_THRESHOLD_LOW, XGA_THRESHOLD_HIGH,
+    PROB_THRESHOLD_SINGLE, PROB_THRESHOLD_ACCA,
+    VALUE_MARGIN, FORM_BOOST, ABSENCE_PENALTY,
 )
+from .poisson_model import p_btts, p_over_2_5, dixon_coles_correction
+from .filters import (
+    compute_team_metrics, compute_xg_metrics,
+    h2h_btts_rate, apply_filters,
+)
+from .kelly import has_value, ev_percent, kelly_stake, breakeven_odds, classify_level
 
 log = logging.getLogger(__name__)
 
+# Re-exportar para compatibilidad
+FORM_BOOST = 0.05
+ABSENCE_PENALTY = 0.05
 
-# ─── Utilidades ─────────────────────────────────────────────────────────────
 
 def _f(v) -> float | None:
     try:
@@ -22,59 +29,41 @@ def _f(v) -> float | None:
         return None
 
 
-def _prob(odds_val) -> float | None:
-    o = _f(odds_val)
-    return (1.0 / o) if o and o > 1.0 else None
+def _extract_odds_value(odd) -> float | None:
+    """Extrae valor numérico de un campo de odds (puede ser str, dict o float)."""
+    if isinstance(odd, dict):
+        return _f(odd.get("last_seen") or odd.get("current") or odd.get("live"))
+    return _f(odd)
 
 
-# ─── Filtro xGA ─────────────────────────────────────────────────────────────
-
-def _xga_penalty(xga_value: float | None) -> float:
-    """
-    Penaliza la probabilidad BTTS si el xGA (goles esperados en contra)
-    del equipo es muy bajo → defensa sólida → BTTS improbable.
-    """
-    if xga_value is None:
-        return 0.0
-    if xga_value < XGA_THRESHOLD_LOW:
-        return XGA_PENALTY_LOW   # -12%
-    elif xga_value < XGA_THRESHOLD_HIGH:
-        return XGA_PENALTY_HIGH  # -8%
-    return 0.0
-
-
-# ─── Forma reciente ─────────────────────────────────────────────────────────
-
-def _compute_form(matches_list: list[dict], team_id: str) -> tuple[int, int, int]:
+def _compute_form(recent_matches: list[dict], team_id: str) -> tuple[int, int, int]:
+    """(wins, draws, losses) en últimos partidos."""
     wins = draws = losses = 0
-    for m in matches_list:
+    for m in recent_matches:
         home_id = m.get("home_team", {}).get("id")
         away_id = m.get("away_team", {}).get("id")
-        score = m.get("score", {})
-        score_h = _f(score.get("home"))
-        score_a = _f(score.get("away"))
-        if score_h is None or score_a is None:
+        sh = _f(m.get("home_team", {}).get("score"))
+        sa = _f(m.get("away_team", {}).get("score"))
+        if sh is None or sa is None:
             continue
         if team_id == home_id:
-            if score_h > score_a: wins += 1
-            elif score_h == score_a: draws += 1
+            if sh > sa: wins += 1
+            elif sh == sa: draws += 1
             else: losses += 1
         elif team_id == away_id:
-            if score_a > score_h: wins += 1
-            elif score_a == score_h: draws += 1
+            if sa > sh: wins += 1
+            elif sa == sh: draws += 1
             else: losses += 1
     return wins, draws, losses
 
 
-# ─── Detección de ausencias ─────────────────────────────────────────────────
-
-def _check_absences(lineups_side: dict, players_list: list[dict]) -> list[str]:
-    """Devuelve nombres de delanteros clave ausentes del XI."""
-    if not lineups_side or not players_list:
+def _check_absences(lineups_data: dict, players_list: list[dict], side: str) -> list[str]:
+    """Delanteros clave ausentes del XI."""
+    if not lineups_data or not players_list:
         return []
-
-    xi = lineups_side.get("starting_xi", [])
-    subs = lineups_side.get("substitutes", [])
+    side_data = lineups_data.get(side, {})
+    xi = side_data.get("starting_xi", [])
+    subs = side_data.get("substitutes", [])
     present_ids = {p.get("player_id") or p.get("id") for p in xi + subs}
 
     forward_positions = {"ST", "CF", "LW", "RW", "FW"}
@@ -88,118 +77,171 @@ def _check_absences(lineups_side: dict, players_list: list[dict]) -> list[str]:
     return absent
 
 
-# ─── Análisis principal ─────────────────────────────────────────────────────
-
 def analyze(match: dict,
             st: dict,
             od: dict,
-            form_data: dict | None = None,
+            home_recent: list[dict],
+            away_recent: list[dict],
+            home_stats_cache: dict[str, dict],
+            away_stats_cache: dict[str, dict],
+            h2h_matches: list[dict] | None = None,
             lineups_data: dict | None = None,
             home_players: list[dict] | None = None,
-            away_players: list[dict] | None = None) -> list[str]:
+            away_players: list[dict] | None = None,
+            ) -> dict | None:
+    """
+    Analiza un partido completo.
+    Devuelve dict con:
+        - bets: lista de apuestas con metadata
+        - filtered: bool (¿pasó filtros?)
+        - filter_reasons: lista de razones si fue filtrado
+        - p_poisson: probabilidad Poisson
+        - p_model: probabilidad final
+        - p_market: probabilidad implícita de mercado
+        - level: 1, 2, 3
+    O None si no hay datos suficientes.
+    """
     home = match.get("home_team", {}).get("name", "Home")
     away = match.get("away_team", {}).get("name", "Away")
     home_id = match.get("home_team", {}).get("id", "")
     away_id = match.get("away_team", {}).get("id", "")
 
-    # ── xG / xGA ──
-    overview = st.get("overview", {}) if st else {}
-    xg_data = overview.get("expected_goals", {})
-    xg_all = xg_data.get("all", {}) if isinstance(xg_data, dict) else {}
+    # ═══════════════════════════════════════════════════════════
+    # 1. EXTRAER xG DEL MATCH (si está disponible)
+    # ═══════════════════════════════════════════════════════════
+    xg_h = _f(st.get("home", {}).get("xg")) or _f(
+        st.get("overview", {}).get("expected_goals", {}).get("all", {}).get("home"))
+    xg_a = _f(st.get("away", {}).get("xg")) or _f(
+        st.get("overview", {}).get("expected_goals", {}).get("all", {}).get("away"))
 
-    xg_h = _f(xg_all.get("home", 0)) or 0
-    xg_a = _f(xg_all.get("away", 0)) or 0
-    total_xg = xg_h + xg_a
+    # ═══════════════════════════════════════════════════════════
+    # 2. MÉTRICAS DE EQUIPOS (últimos 10)
+    # ═══════════════════════════════════════════════════════════
+    home_metrics = compute_team_metrics(home_recent, home_id)
+    away_metrics = compute_team_metrics(away_recent, away_id)
 
-    # xGA (goles esperados EN CONTRA)
-    xga_data = xg_data.get("against", {}) if isinstance(xg_data, dict) else {}
-    xga_all = xga_data.get("all", {}) if isinstance(xga_data, dict) else {}
-    xga_h = _f(xga_all.get("home"))
-    xga_a = _f(xga_all.get("away"))
+    home_xg_for, home_xg_against = compute_xg_metrics(home_recent, home_id, home_stats_cache)
+    away_xg_for, away_xg_against = compute_xg_metrics(away_recent, away_id, away_stats_cache)
 
-    # ── Penalización xGA ──
-    xga_pen = _xga_penalty(xga_h) + _xga_penalty(xga_a)
+    # ═══════════════════════════════════════════════════════════
+    # 3. MODELO POISSON / DIXON-COLES
+    # ═══════════════════════════════════════════════════════════
+    # λ = xG promedio del equipo (for) ajustado por xG del rival (against)
+    lambda_home = (home_xg_for + away_xg_against) / 2.0
+    lambda_away = (away_xg_for + home_xg_against) / 2.0
 
-    # ── Forma ──
-    form_boost = 0.0
-    if form_data:
-        h_w, _, _ = _compute_form(form_data.get("home", []), home_id)
-        a_w, _, _ = _compute_form(form_data.get("away", []), away_id)
-        if xg_h >= xg_a and h_w >= 4:
-            form_boost = FORM_BOOST
-        elif xg_a > xg_h and a_w >= 4:
-            form_boost = FORM_BOOST
+    # Si hay xG del match actual, usarlo como señal adicional
+    if xg_h and xg_a:
+        lambda_home = (lambda_home + xg_h) / 2.0
+        lambda_away = (lambda_away + xg_a) / 2.0
 
-    # ── Ausencias ──
-    home_absent = _check_absences(
-        (lineups_data or {}).get("home", {}), home_players or [])
-    away_absent = _check_absences(
-        (lineups_data or {}).get("away", {}), away_players or [])
-    home_penalty = ABSENCE_PENALTY if home_absent else 0.0
-    away_penalty = ABSENCE_PENALTY if away_absent else 0.0
+    p_poisson = p_btts(lambda_home, lambda_away)
+    p_poisson_dc = dixon_coles_correction(p_poisson, lambda_home, lambda_away, rho=-0.1)
 
-    # ── Evaluar mercados ──
-    candidates: list[tuple[str, float]] = []
+    # ═══════════════════════════════════════════════════════════
+    # 4. CUOTAS DE MERCADO
+    # ═══════════════════════════════════════════════════════════
     bookmakers = od.get("bookmakers", []) if od else []
+    btts_odds: float | None = None
+    btts_bookmaker: str = ""
 
     for bk in bookmakers:
         markets = bk.get("markets", {})
-
-        # BTTS SÍ
         btts = markets.get("btts") or {}
-        btts_yes = btts.get("yes", {})
-        btts_val = btts_yes.get("last_seen") or btts_yes.get("current") \
-            if isinstance(btts_yes, dict) else btts_yes
-        p = _prob(btts_val)
-        if p:
-            adj = p + form_boost + xga_pen - (home_penalty + away_penalty) / 2
-            if adj >= PROB_THRESHOLD:
-                tag = "⚠️" if (home_absent or away_absent) else "🎯"
-                label = f"{tag} BTTS SÍ  {home} vs {away}  (P≈{adj:.0%})"
-                if home_absent:
-                    label += f"  [⚡ {home_absent[0]}]"
-                if away_absent:
-                    label += f"  [⚡ {away_absent[0]}]"
-                candidates.append((label, adj))
+        btts_yes = btts.get("yes")
+        val = _extract_odds_value(btts_yes)
+        if val and val > 1.0:
+            # Priorizar Pinnacle (más sharp)
+            if bk.get("bookmaker") == "Pinnacle" or btts_odds is None:
+                btts_odds = val
+                btts_bookmaker = bk.get("bookmaker", "?")
 
-        # Over 2.5 goles
-        ou = markets.get("total_goals") or markets.get("over_under_25") or {}
-        ou_over = ou.get("over", {})
-        ou_val = ou_over.get("last_seen") or ou_over.get("current") \
-            if isinstance(ou_over, dict) else ou_over
-        p = _prob(ou_val)
-        if p:
-            adj = p + form_boost + xga_pen - (home_penalty + away_penalty) / 2
-            if adj >= PROB_THRESHOLD:
-                label = f"⚽ Over 2.5  {home} vs {away}  (P≈{adj:.0%}, xG={total_xg:.2f})"
-                candidates.append((label, adj))
+    p_market = 1.0 / btts_odds if btts_odds and btts_odds > 1.0 else None
 
-        # Over corners
-        co = markets.get("corners_ou") or markets.get("corners") or {}
-        co_over = co.get("over", {})
-        co_val = co_over.get("last_seen") or co_over.get("current") \
-            if isinstance(co_over, dict) else co_over
-        line = co.get("line", "?")
-        p = _prob(co_val)
-        if p and p >= PROB_THRESHOLD:
-            candidates.append((f"🥅 Over {line} corners  {home} vs {away}  (P≈{p:.0%})", p))
+    # ═══════════════════════════════════════════════════════════
+    # 5. AJUSTES: FORMA + AUSENCIAS
+    # ═══════════════════════════════════════════════════════════
+    form_boost = 0.0
+    h_w, _, _ = _compute_form(home_recent, home_id)
+    a_w, _, _ = _compute_form(away_recent, away_id)
+    if h_w >= 4 and home_xg_for >= 1.2:
+        form_boost = FORM_BOOST
+    elif a_w >= 4 and away_xg_for >= 1.2:
+        form_boost = FORM_BOOST
 
-        # Asian Handicap (línea negativa = equipo que marca)
-        ah = markets.get("asian_handicap") or {}
-        ah_line = _f(ah.get("line"))
-        p_home = _prob(ah.get("home"))
-        p_away = _prob(ah.get("away"))
-        if ah_line is not None and ah_line < 0:
-            if p_home and (p_home + form_boost - home_penalty) >= PROB_THRESHOLD:
-                candidates.append((f"🔥 {home} marca (AH {ah_line:+.1f})  (P≈{p_home:.0%})", p_home))
-            if p_away and (p_away + form_boost - away_penalty) >= PROB_THRESHOLD:
-                candidates.append((f"🔥 {away} marca (AH {ah_line:+.1f})  (P≈{p_away:.0%})", p_away))
+    home_absent = _check_absences((lineups_data or {}).get("home", {}), home_players or [])
+    away_absent = _check_absences((lineups_data or {}).get("away", {}), away_players or [])
+    home_penalty = ABSENCE_PENALTY if home_absent else 0.0
+    away_penalty = ABSENCE_PENALTY if away_absent else 0.0
 
-    # ── Dedup: mejor prob por tipo ──
-    best: dict[str, tuple[str, float]] = {}
-    for label, p in candidates:
-        key = label.split("  ")[0]
-        if key not in best or p > best[key][1]:
-            best[key] = (label, p)
+    # ═══════════════════════════════════════════════════════════
+    # 6. FILTROS ESTADÍSTICOS + CONTEXTUALES
+    # ═══════════════════════════════════════════════════════════
+    current_date = datetime.now(timezone.utc)
+    h2h_btts = h2h_btts_rate(h2h_matches) if h2h_matches else None
 
-    return [v[0] for v in sorted(best.values(), key=lambda x: -x[1])]   
+    filters_passed, filter_reasons = apply_filters(
+        home_metrics=home_metrics,
+        away_metrics=away_metrics,
+        home_xg_for=home_xg_for,
+        home_xg_against=home_xg_against,
+        away_xg_for=away_xg_for,
+        away_xg_against=away_xg_against,
+        h2h_btts=h2h_btts,
+        current_date=current_date,
+    )
+
+    # ═══════════════════════════════════════════════════════════
+    # 7. PROBABILIDAD FINAL (blend Poisson + mercado)
+    # ═══════════════════════════════════════════════════════════
+    # P_model = 0.5 * P_poisson_dc + 0.5 * P_mercado + form_boost - penalties
+    if p_market:
+        p_model = 0.5 * p_poisson_dc + 0.5 * p_market + form_boost - (home_penalty + away_penalty) / 2
+    else:
+        p_model = p_poisson_dc + form_boost - (home_penalty + away_penalty) / 2
+
+    p_model = min(0.99, max(0.01, p_model))
+
+    # ═══════════════════════════════════════════════════════════
+    # 8. VALUE + KELLY + NIVEL
+    # ═══════════════════════════════════════════════════════════
+    value_flag = has_value(p_model, btts_odds, VALUE_MARGIN) if btts_odds else False
+    ev = ev_percent(p_model, btts_odds) if btts_odds else 0.0
+    stake = kelly_stake(p_model, btts_odds) if btts_odds and value_flag else 0.0
+    level = classify_level(p_model, ev, value_flag)
+
+    # ═══════════════════════════════════════════════════════════
+    # 9. RESULTADO
+    # ═══════════════════════════════════════════════════════════
+    result = {
+        "home": home,
+        "away": away,
+        "home_id": home_id,
+        "away_id": away_id,
+        "p_poisson": p_poisson,
+        "p_poisson_dc": p_poisson_dc,
+        "p_market": p_market,
+        "p_model": p_model,
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+        "btts_odds": btts_odds,
+        "btts_bookmaker": btts_bookmaker,
+        "value": value_flag,
+        "ev": ev,
+        "stake": stake,
+        "level": level,
+        "filters_passed": filters_passed,
+        "filter_reasons": filter_reasons,
+        "form_boost": form_boost,
+        "home_penalty": home_penalty,
+        "away_penalty": away_penalty,
+        "home_absent": home_absent,
+        "away_absent": away_absent,
+        "home_btts_rate": home_metrics.get("btts_rate", 0),
+        "away_btts_rate": away_metrics.get("btts_rate", 0),
+        "home_xg_against": home_xg_against,
+        "away_xg_against": away_xg_against,
+        "h2h_btts": h2h_btts,
+    }
+
+    return result   
