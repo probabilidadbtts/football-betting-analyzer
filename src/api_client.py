@@ -9,7 +9,7 @@ from .config import API_KEY, BASE_URL, PER_PAGE
 
 log = logging.getLogger(__name__)
 H = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
-TIMEOUT = 10  # reducido de 30→10s
+TIMEOUT = 10
 
 
 def _get(path: str, params: dict | None = None, retries: int = 2) -> dict:
