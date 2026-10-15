@@ -18,8 +18,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 
+def _d(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
 def _fetch_team_context(team_id: str) -> tuple[list[dict], dict[str, dict]]:
     """Obtiene últimos 10 partidos + stats de cada uno para un equipo."""
+    if not team_id:
+        return [], {}
     recent = team_recent_matches(team_id, 10)
     stats_cache: dict[str, dict] = {}
     for m in recent:
@@ -32,10 +38,10 @@ def _fetch_team_context(team_id: str) -> tuple[list[dict], dict[str, dict]]:
 def _process_match(m: dict) -> dict | None:
     """Procesa UN partido completo."""
     mid = m.get("id", "?")
-    home = m.get("home_team", {}).get("name", "?")
-    away = m.get("away_team", {}).get("name", "?")
-    home_id = m.get("home_team", {}).get("id", "")
-    away_id = m.get("away_team", {}).get("id", "")
+    home = (_d(m.get("home_team"))).get("name", "?")
+    away = (_d(m.get("away_team"))).get("name", "?")
+    home_id = (_d(m.get("home_team"))).get("id", "")
+    away_id = (_d(m.get("away_team"))).get("id", "")
 
     try:
         # ── Llamadas principales ──
@@ -43,17 +49,18 @@ def _process_match(m: dict) -> dict | None:
         od = match_odds(mid)
 
         if not od or not od.get("bookmakers"):
-            return None  # Sin cuotas → no analizable
+            log.debug("  ⏭ %s vs %s: sin cuotas", home, away)
+            return None
 
-        # ── Contexto de equipos (últimos 10 + stats) ──
+        # ── Contexto de equipos ──
         home_recent, home_stats_cache = _fetch_team_context(home_id)
         away_recent, away_stats_cache = _fetch_team_context(away_id)
 
-        # ── H2H (partidos del home donde aparece el away) ──
+        # ── H2H ──
         h2h = []
         for m2 in home_recent:
-            h_id = m2.get("home_team", {}).get("id")
-            a_id = m2.get("away_team", {}).get("id")
+            h_id = (_d(m2.get("home_team"))).get("id")
+            a_id = (_d(m2.get("away_team"))).get("id")
             if h_id == away_id or a_id == away_id:
                 h2h.append(m2)
 
@@ -63,7 +70,7 @@ def _process_match(m: dict) -> dict | None:
         away_players: list[dict] = []
         try:
             lineups_data = match_lineups(mid)
-            if lineups_data:
+            if lineups_data and isinstance(lineups_data, dict) and lineups_data:
                 home_players = team_players(home_id)
                 away_players = team_players(away_id)
         except Exception:
@@ -84,10 +91,9 @@ def _process_match(m: dict) -> dict | None:
 
         if result:
             status = "✓" if result["filters_passed"] else "⛔"
-            log.info("  %s %s vs %s → P=%.0f%% L%d %s",
+            log.info("  %s %s vs %s → P=%.0f%% L%d",
                      status, home, away,
-                     result["p_model"] * 100, result["level"],
-                     result["filter_reasons"][0] if not result["filters_passed"] else "")
+                     result["p_model"] * 100, result["level"])
         return result
 
     except Exception as e:
@@ -99,7 +105,6 @@ def main():
     today = date.today().isoformat()
     log.info("═══ Análisis pre-match %s ═══", today)
 
-    # ── Obtener TODOS los partidos de hoy ──
     comp_filter = COMPETITION_IDS[0] if COMPETITION_IDS else None
     day_matches = matches(
         date_from=today, date_to=today,
@@ -111,7 +116,6 @@ def main():
     eligible = [m for m in day_matches if m.get("odds_available")]
     log.info("Con cuotas disponibles: %d", len(eligible))
 
-    # ── Procesar en paralelo ──
     results: list[dict] = []
     total_analyzed = 0
 
@@ -129,8 +133,6 @@ def main():
                 log.info("  Progreso: %d/%d", total_analyzed, min(len(eligible), MAX_MATCHES))
 
     log.info("═══ Analizados: %d | Con datos: %d ═══", total_analyzed, len(results))
-
-    # ── Enviar a Telegram ──
     send_analysis(results, today, total_analyzed)
 
 
