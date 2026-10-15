@@ -2,23 +2,19 @@ name: Daily Pre-Match Analysis
 
 on:
   schedule:
-    - cron: "0 8 * * *"        # 08:00 UTC
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10   # 10 min es más que suficiente con paralelismo
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Run pre-match analysis
         env:
           THESTATSAPI_API_KEY: ${{ secrets.THESTATSAPI_API_KEY }}
