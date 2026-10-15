@@ -2,23 +2,19 @@ name: Live Match Analysis
 
 on:
   schedule:
-    - cron: "*/30 10-23 * * *"   # cada 30 min, 10:00–23:30 UTC
+    - cron: "*/30 10-23 * * *"
   workflow_dispatch:
 
 jobs:
   analyze-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Run live analysis
         env:
           THESTATSAPI_API_KEY: ${{ secrets.THESTATSAPI_API_KEY }}
