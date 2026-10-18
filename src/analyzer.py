@@ -1,12 +1,15 @@
 """
 Motor de análisis principal.
 Combina Poisson + cuotas + filtros + Kelly.
+Se reestructuró la extracción/agregación de mercado para usar varios bookmakers
+y se añadió consumo mínimo de partidos recientes en filtros.
 """
 import logging
 from datetime import datetime, timezone
+from statistics import mean
 from .config import (
     PROB_THRESHOLD_SINGLE, PROB_THRESHOLD_ACCA,
-    VALUE_MARGIN,
+    VALUE_MARGIN, MAX_BOOKMAKERS_AGG,
 )
 from .poisson_model import p_btts, p_over_2_5, dixon_coles_correction
 from .filters import (
@@ -41,8 +44,47 @@ def _l(v) -> list:
 def _extract_odds_value(odd) -> float | None:
     """Extrae valor numérico de un campo de odds (puede ser str, dict o float)."""
     if isinstance(odd, dict):
-        return _f(odd.get("last_seen") or odd.get("current") or odd.get("live"))
+        # intentar campos comunes
+        return _f(odd.get("last_seen") or odd.get("current") or odd.get("live") or odd.get("price"))
     return _f(odd)
+
+
+def _aggregate_market_probability(bookmakers: list[dict], max_bookmakers: int = 3) -> tuple[float | None, float | None, str]:
+    """Agrega probabilidades implícitas de varios bookmakers.
+
+    - Extrae la cuota 'btts'->'yes' de cada bookmaker.
+    - Toma las mejores `max_bookmakers` en términos de cuota (mayor cuota = mejor para el apostador).
+    - Calcula p_market como el promedio simple de probabilidades implícitas (1/odds).
+    - Devuelve (p_market, best_odds, best_bookmaker)
+    """
+    if not bookmakers:
+        return None, None, ""
+
+    candidates: list[tuple[float, str]] = []  # (odds, bookmaker)
+    for bk in bookmakers:
+        if not isinstance(bk, dict):
+            continue
+        markets = _d(bk.get("markets"))
+        btts = _d(markets.get("btts"))
+        btts_yes = btts.get("yes")
+        val = _extract_odds_value(btts_yes)
+        if val and val > 1.0:
+            candidates.append((val, bk.get("bookmaker", "?")))
+
+    if not candidates:
+        return None, None, ""
+
+    # Ordenar por cuota descendente (mejor para apostador) y quedarse con top N
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:max_bookmakers]
+
+    odds_list = [o for o, _ in top]
+    prob_list = [1.0 / o for o in odds_list]
+
+    p_market = mean(prob_list) if prob_list else None
+    # Mejor cuota y su bookmaker (la primera en la lista ordenada)
+    best_odds, best_bk = top[0]
+    return p_market, best_odds, best_bk
 
 
 def _compute_form(recent_matches: list[dict], team_id: str) -> tuple[int, int, int]:
@@ -56,13 +98,19 @@ def _compute_form(recent_matches: list[dict], team_id: str) -> tuple[int, int, i
         if sh is None or sa is None:
             continue
         if team_id == home_id:
-            if sh > sa: wins += 1
-            elif sh == sa: draws += 1
-            else: losses += 1
+            if sh > sa:
+                wins += 1
+            elif sh == sa:
+                draws += 1
+            else:
+                losses += 1
         elif team_id == away_id:
-            if sa > sh: wins += 1
-            elif sa == sh: draws += 1
-            else: losses += 1
+            if sa > sh:
+                wins += 1
+            elif sa == sh:
+                draws += 1
+            else:
+                losses += 1
     return wins, draws, losses
 
 
@@ -134,25 +182,11 @@ def analyze(match: dict,
     p_poisson = p_btts(lambda_home, lambda_away)
     p_poisson_dc = dixon_coles_correction(p_poisson, lambda_home, lambda_away, rho=-0.1)
 
-    # ═══ 4. CUOTAS DE MERCADO ═══
+    # ═══ 4. CUOTAS DE MERCADO (AGREGADAS) ═══
     od = _d(od)
     bookmakers = _l(od.get("bookmakers"))
-    btts_odds: float | None = None
-    btts_bookmaker: str = ""
 
-    for bk in bookmakers:
-        if not isinstance(bk, dict):
-            continue
-        markets = _d(bk.get("markets"))
-        btts = _d(markets.get("btts"))
-        btts_yes = btts.get("yes")
-        val = _extract_odds_value(btts_yes)
-        if val and val > 1.0:
-            if bk.get("bookmaker") == "Pinnacle" or btts_odds is None:
-                btts_odds = val
-                btts_bookmaker = bk.get("bookmaker", "?")
-
-    p_market = 1.0 / btts_odds if btts_odds and btts_odds > 1.0 else None
+    p_market, btts_odds, btts_bookmaker = _aggregate_market_probability(bookmakers, max_bookmakers=MAX_BOOKMAKERS_AGG)
 
     # ═══ 5. AJUSTES: FORMA + AUSENCIAS ═══
     form_boost = 0.0
@@ -227,4 +261,4 @@ def analyze(match: dict,
         "home_xg_against": home_xg_against,
         "away_xg_against": away_xg_against,
         "h2h_btts": h2h_btts,
-    }   
+    }
