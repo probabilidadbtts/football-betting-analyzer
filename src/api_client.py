@@ -12,7 +12,12 @@ H = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
 
 
 def _get(path: str, params: dict | None = None, retries: int = 2) -> dict:
-    """GET con retry exponencial ante 429/5xx. Timeout de 10s."""
+    """GET con retry exponencial ante 429/5xx. Timeout de 10s.
+
+    Mejora: maneja respuestas que no son JSON y errores en la decodificación JSON
+    para evitar que r.json() lance excepciones no controladas que rompan el flujo
+    y provoquen mensajes de log inesperados.
+    """
     for attempt in range(retries):
         try:
             r = requests.get(f"{BASE_URL}{path}", headers=H, params=params, timeout=TIMEOUT)
@@ -26,22 +31,49 @@ def _get(path: str, params: dict | None = None, retries: int = 2) -> dict:
             log.warning("ERROR: GET %s → %s", path, e)
             return {}
 
+        # Rate limit / server errors
         if r.status_code == 429:
             wait = 2 ** attempt
-            log.warning("429 rate-limit, esperando %ss…", wait)
+            log.warning("429 rate-limit for %s, waiting %ss…", path, wait)
             time.sleep(wait)
             continue
         if r.status_code >= 500:
+            log.warning("Server error %s: %s", r.status_code, r.text[:200])
             time.sleep(1)
             continue
         if r.status_code == 404:
+            # Not found -> return empty payload
+            log.debug("404 GET %s", path)
             return {}
-        r.raise_for_status()
-        return r.json()
+
+        # At this point we expect a 2xx; ensure we surface HTTP errors
+        try:
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            log.warning("HTTP error GET %s → %s", path, e)
+            return {}
+
+        # Verificar content-type antes de parsear como JSON
+        ct = r.headers.get("Content-Type", "")
+        if "application/json" not in ct.lower():
+            # Si la API devolvió un HTML/error, loguearlo de forma segura
+            body_preview = r.text[:500].replace("\n", " ")
+            log.warning("Non-JSON response for GET %s: status=%s content-type=%s body=%s", path, r.status_code, ct, body_preview)
+            return {}
+
+        try:
+            return r.json()
+        except ValueError:
+            # JSON malformed
+            body_preview = r.text[:500].replace("\n", " ")
+            log.warning("Invalid JSON from GET %s: %s", path, body_preview)
+            return {}
+
     return {}
 
 
-# ─── Partidos ───────────────────────────────────────────────────────────────
+# ─── Partidos ──────────────────────────────────────────────────────────
+
 
 def matches(date_from: str,
             date_to: str | None = None,
@@ -88,12 +120,13 @@ def team_recent_matches(team_id: str, n: int = 10, status: str = "finished") -> 
 
 # ─── Estadísticas + xG ──────────────────────────────────────────────────────
 
+
 def match_stats(match_id: str) -> dict:
     resp = _get(f"/football/matches/{match_id}/stats")
     return resp.get("data", {})
 
 
-# ─── Cuotas ─────────────────────────────────────────────────────────────────
+# ─── Cuotas ───────────────────────────────────────────────────────────
 
 def match_odds(match_id: str) -> dict:
     resp = _get(f"/football/matches/{match_id}/odds")
@@ -105,7 +138,7 @@ def match_odds_live(match_id: str) -> dict:
     return resp.get("data", {})
 
 
-# ─── Formaciones ────────────────────────────────────────────────────────────
+# ─── Formaciones ─────────────────────────────────────────────────────────
 
 def match_lineups(match_id: str) -> dict:
     resp = _get(f"/football/matches/{match_id}/lineups")
