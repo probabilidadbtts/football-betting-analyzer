@@ -1,74 +1,70 @@
 """
-Configuración central del analizador de value betting.
-Todos los umbrales y pesos están aquí para facilitar backtesting y ajuste.
+Configuración central del analizador cuantitativo de value betting.
 """
+from __future__ import annotations
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── API ────────────────────────────────────────────────────────────
-API_KEY   = os.getenv("THESTATSAPI_API_KEY", "")
-BASE_URL  = "https://api.thestatsapi.com/api"
-TIMEOUT   = 12
-PER_PAGE  = 100
-MAX_RETRIES = 3
+# --- TheStatsAPI ---
+API_KEY: str = os.getenv("THESTATSAPI_API_KEY", "")
+BASE_URL: str = "https://api.thestatsapi.com/api"
+TIMEOUT: int = 15
+PER_PAGE: int = 100
+MAX_RETRIES: int = 3
 
-# ─── Telegram ───────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+# --- Telegram ---
+TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ─── Competiciones (vacío = TODAS las que tengan odds) ──────────────
-# Ejemplo: ["comp_3039", "comp_8814"]  # Premier + LaLiga
+# Competiciones (vacío = todas las que tengan cuotas)
 COMPETITION_IDS: list[str] = []
 
-# ─── Mercados a analizar ────────────────────────────────────────────
+# --- Mercados Analizados ---
 MARKETS = {
-    "btts_yes":        "BTTS Yes",
-    "over_25":         "Over 2.5",
-    "home_win":        "1 (Home)",
-    "draw":            "X (Draw)",
-    "away_win":        "2 (Away)",
-    "dc_1x":           "1X",
-    "dc_12":           "12",
-    "dc_x2":           "X2",
+    "home_win": "1 (Home)",
+    "draw": "X (Draw)",
+    "away_win": "2 (Away)",
+    "over_25": "Over 2.5",
+    "under_25": "Under 2.5",
+    "btts_yes": "BTTS Yes",
+    "btts_no": "BTTS No",
+    "dc_1x": "1X",
+    "dc_x2": "X2",
+    "dc_12": "12",
+    "home_dnb": "DNB 1",
+    "away_dnb": "DNB 2",
 }
 
-PREFERRED_BOOKMAKERS = ["pinnacle", "bet365", "paddy-power", "betmgm-uk", "betfair-exchange"]
+SHARP_BOOKMAKERS = ["pinnacle", "betfair-exchange", "betfair"]
 
-# ─── Modelo ─────────────────────────────────────────────────────────
-POISSON_MAX_GOALS = 10
-HOME_ADVANTAGE    = 0.12
-DIXON_COLES_RHO   = -0.10
-LEAGUE_AVG_GOALS  = 2.70
+# --- Parámetros del Modelo Matemático ---
+POISSON_MAX_GOALS: int = 9
+HOME_ADVANTAGE_FACTOR: float = 1.10   # +10% de ventaja ofensiva local promedio
+DIXON_COLES_RHO: float = -0.06        # Correlación empírica para bajas puntuaciones (0-0, 1-0, 0-1, 1-1)
+DEFAULT_LEAGUE_AVG_GOALS: float = 2.65
 
-WEIGHT_POISSON    = 0.55
-WEIGHT_MARKET     = 0.35
-WEIGHT_FORM       = 0.10
+# Pesos del ensamble Bayesiano (Modelo vs Mercado desmargenado)
+WEIGHT_MODEL: float = 0.45
+WEIGHT_MARKET: float = 0.55
 
-# ─── Value & Kelly ──────────────────────────────────────────────────
-MIN_EDGE          = 0.035
-MIN_EV_PERCENT    = 4.0
-KELLY_FRACTION    = 0.20
-BANKROLL_UNITS    = 100
-MAX_STAKE_UNITS   = 8.0
+# --- Filtros de Valor y Kelly Criterion ---
+MIN_EDGE: float = 0.025               # Mínimo 2.5% de ventaja real
+MIN_EV_PERCENT: float = 3.0           # Mínimo +3.0% de Valor Esperado
+KELLY_FRACTION: float = 0.08          # Criterio de Kelly fraccional conservador (1/12 Kelly)
+BANKROLL_UNITS: float = 100.0
+MAX_STAKE_UNITS: float = 2.0          # Máximo 2% del bankroll por selección
 
-# ─── Scoring de contexto (soft filters) ─────────────────────────────
-MIN_CONTEXT_SCORE = 45
+# --- Niveles de Convicción ---
+LEVEL1_EDGE: float = 0.055
+LEVEL1_CONTEXT: float = 62.0
+LEVEL2_EDGE: float = 0.025
+LEVEL2_CONTEXT: float = 48.0
+MIN_CONTEXT_SCORE: float = 40.0
 
-BTTS_RATE_GOOD    = 0.55
-XGA_SOFT_MIN      = 1.05
-CLEAN_SHEET_SOFT_MAX = 0.40
-REST_DAYS_IDEAL   = 4
-REST_DAYS_MIN     = 2
-
-# ─── Clasificación de oportunidades ─────────────────────────────────
-LEVEL1_EDGE       = 0.07
-LEVEL1_CONTEXT    = 65
-LEVEL2_EDGE       = 0.04
-LEVEL2_CONTEXT    = 50
-
-# ─── Paralelismo y límites ──────────────────────────────────────────
-MAX_WORKERS       = 12
-MAX_MATCHES       = 250
-RECENT_MATCHES_N  = 12
+# --- Concurrencia y Datos ---
+MAX_WORKERS: int = 8
+MAX_MATCHES: int = 150
+RECENT_MATCHES_N: int = 15
