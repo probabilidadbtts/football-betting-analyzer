@@ -1,124 +1,127 @@
 """
-Extracción y agregación de cuotas de múltiples bookmakers.
-Busca la mejor cuota (mayor) para cada selección → maximiza edge real.
+Extracción de cuotas y cálculo de probabilidades de mercado justas
+mediante desmargenación proporcional (un-vigging) completa.
 """
 from __future__ import annotations
 
-from statistics import mean
 from typing import Any
+from ..config import SHARP_BOOKMAKERS
 
 
-def _f(v: Any) -> float | None:
+def _parse_float(v: Any) -> float | None:
     if v is None:
         return None
     if isinstance(v, dict):
-        for key in ("last_seen", "current", "live", "price", "opening"):
-            if key in v and v[key] is not None:
+        for k in ("last_seen", "current", "price", "decimal", "value"):
+            if k in v and v[k] is not None:
                 try:
-                    return float(v[key])
-                except (TypeError, ValueError):
-                    continue
+                    return float(v[k])
+                except (ValueError, TypeError):
+                    pass
         return None
     try:
         return float(v)
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return None
 
 
-def _d(v: Any) -> dict:
-    return v if isinstance(v, dict) else {}
+def devig_proportional(odds_dict: dict[str, float]) -> dict[str, float]:
+    """Elimina el overround de una casa de apuestas de forma proporcional."""
+    inv_sum = sum(1.0 / od for od in odds_dict.values() if od > 1.0)
+    if inv_sum <= 0:
+        return {}
+    return {k: (1.0 / od) / inv_sum for k, od in odds_dict.items() if od > 1.0}
 
 
-def extract_all_odds(odds_payload: dict) -> dict[str, list[tuple[float, str]]]:
+def extract_and_devig_markets(odds_payload: dict) -> tuple[dict[str, tuple[float, str]], dict[str, float]]:
     """
-    Extrae todas las cuotas disponibles de todos los bookmakers.
-    Retorna: { market_key: [(odds, bookmaker_name), ...] }
+    Retorna:
+      - best_odds: { "market_key": (mejor_cuota_disponible, nombre_bookmaker) }
+      - fair_market_probs: { "market_key": probabilidad_justa_consenso_sin_margen }
     """
-    result: dict[str, list[tuple[float, str]]] = {
-        "btts_yes": [], "btts_no": [],
-        "over_25": [], "under_25": [],
-        "home_win": [], "draw": [], "away_win": [],
-        "home_dnb": [], "away_dnb": [],
-        "dc_1x": [], "dc_12": [], "dc_x2": [],
-    }
-
     bookmakers = odds_payload.get("bookmakers") or []
     if not isinstance(bookmakers, list):
-        return result
+        return {}, {}
+
+    best_odds: dict[str, tuple[float, str]] = {}
+    fair_samples: dict[str, list[tuple[float, float]]] = {}  # {mkt: [(fair_prob, weight)]}
+
+    def _track_best(m_key: str, od: float, bk_name: str):
+        if od > 1.01:
+            if m_key not in best_odds or od > best_odds[m_key][0]:
+                best_odds[m_key] = (od, bk_name)
 
     for bk in bookmakers:
         if not isinstance(bk, dict):
             continue
-        name = bk.get("bookmaker") or bk.get("name") or "?"
-        markets = _d(bk.get("markets"))
+        name = str(bk.get("bookmaker") or bk.get("name") or "unknown").lower()
+        mkts = bk.get("markets") or {}
+        weight = 2.0 if any(s in name for s in SHARP_BOOKMAKERS) else 1.0
 
-        # BTTS
-        btts = _d(markets.get("btts"))
-        yes = _f(btts.get("yes"))
-        no = _f(btts.get("no"))
-        if yes and yes > 1.01:
-            result["btts_yes"].append((yes, name))
-        if no and no > 1.01:
-            result["btts_no"].append((no, name))
+        # 1. Match Odds (1X2)
+        mo = mkts.get("match_odds") or {}
+        h, d, a = _parse_float(mo.get("home")), _parse_float(mo.get("draw")), _parse_float(mo.get("away"))
+        if h and d and a:
+            _track_best("home_win", h, name)
+            _track_best("draw", d, name)
+            _track_best("away_win", a, name)
+            dev = devig_proportional({"home_win": h, "draw": d, "away_win": a})
+            for k, p in dev.items():
+                fair_samples.setdefault(k, []).append((p, weight))
 
-        # Total goals 2.5
-        tg = _d(markets.get("total_goals"))
-        line_25 = _d(tg.get("2.5") or tg.get("2,5"))
-        over = _f(line_25.get("over"))
-        under = _f(line_25.get("under"))
-        if over and over > 1.01:
-            result["over_25"].append((over, name))
-        if under and under > 1.01:
-            result["under_25"].append((under, name))
+        # 2. Over / Under 2.5
+        tg = mkts.get("total_goals") or {}
+        line_25 = tg.get("2.5") or tg.get("2,5") or {}
+        ov, un = _parse_float(line_25.get("over")), _parse_float(line_25.get("under"))
+        if ov and un:
+            _track_best("over_25", ov, name)
+            _track_best("under_25", un, name)
+            dev = devig_proportional({"over_25": ov, "under_25": un})
+            for k, p in dev.items():
+                fair_samples.setdefault(k, []).append((p, weight))
 
-        # Match odds (1X2)
-        mo = _d(markets.get("match_odds"))
-        h = _f(mo.get("home"))
-        d = _f(mo.get("draw"))
-        a = _f(mo.get("away"))
-        if h and h > 1.01:
-            result["home_win"].append((h, name))
-        if d and d > 1.01:
-            result["draw"].append((d, name))
-        if a and a > 1.01:
-            result["away_win"].append((a, name))
+        # 3. Both Teams To Score (BTTS)
+        btts = mkts.get("btts") or {}
+        by, bn = _parse_float(btts.get("yes")), _parse_float(btts.get("no"))
+        if by and bn:
+            _track_best("btts_yes", by, name)
+            _track_best("btts_no", bn, name)
+            dev = devig_proportional({"btts_yes": by, "btts_no": bn})
+            for k, p in dev.items():
+                fair_samples.setdefault(k, []).append((p, weight))
 
-        # Draw No Bet
-        dnb = _d(markets.get("draw_no_bet"))
-        dh = _f(dnb.get("home"))
-        da = _f(dnb.get("away"))
-        if dh and dh > 1.01:
-            result["home_dnb"].append((dh, name))
-        if da and da > 1.01:
-            result["away_dnb"].append((da, name))
+        # 4. Double Chance
+        dc = mkts.get("double_chance") or {}
+        d1x = _parse_float(dc.get("home_draw") or dc.get("1x"))
+        dx2 = _parse_float(dc.get("draw_away") or dc.get("x2"))
+        d12 = _parse_float(dc.get("home_away") or dc.get("12"))
+        if d1x: _track_best("dc_1x", d1x, name)
+        if dx2: _track_best("dc_x2", dx2, name)
+        if d12: _track_best("dc_12", d12, name)
 
-        # Double chance
-        dc = _d(markets.get("double_chance"))
-        d1x = _f(dc.get("home_draw") or dc.get("1x"))
-        d12 = _f(dc.get("home_away") or dc.get("12"))
-        dx2 = _f(dc.get("draw_away") or dc.get("x2"))
-        if d1x and d1x > 1.01:
-            result["dc_1x"].append((d1x, name))
-        if d12 and d12 > 1.01:
-            result["dc_12"].append((d12, name))
-        if dx2 and dx2 > 1.01:
-            result["dc_x2"].append((dx2, name))
+        # 5. Draw No Bet
+        dnb = mkts.get("draw_no_bet") or {}
+        dh, da = _parse_float(dnb.get("home")), _parse_float(dnb.get("away"))
+        if dh: _track_best("home_dnb", dh, name)
+        if da: _track_best("away_dnb", da, name)
 
-    return result
+    # Calcular promedio ponderado de probabilidades justas (de-vigged)
+    fair_market_probs: dict[str, float] = {}
+    for m_key, samples in fair_samples.items():
+        total_w = sum(w for _, w in samples)
+        if total_w > 0:
+            fair_market_probs[m_key] = sum(p * w for p, w in samples) / total_w
 
+    # Derivadas de 1X2 si no existen directas
+    if "home_win" in fair_market_probs and "draw" in fair_market_probs and "away_win" in fair_market_probs:
+        ph = fair_market_probs["home_win"]
+        pd = fair_market_probs["draw"]
+        pa = fair_market_probs["away_win"]
+        fair_market_probs.setdefault("dc_1x", ph + pd)
+        fair_market_probs.setdefault("dc_x2", pd + pa)
+        fair_market_probs.setdefault("dc_12", ph + pa)
+        if (ph + pa) > 1e-5:
+            fair_market_probs.setdefault("home_dnb", ph / (ph + pa))
+            fair_market_probs.setdefault("away_dnb", pa / (ph + pa))
 
-def best_odds(candidates: list[tuple[float, str]]) -> tuple[float | None, str]:
-    """Devuelve (mejor_cuota, bookmaker)."""
-    if not candidates:
-        return None, ""
-    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
-    return candidates[0]
-
-
-def market_implied_prob(candidates: list[tuple[float, str]], top_n: int = 3) -> float | None:
-    """Probabilidad implícita promedio de las top-N mejores cuotas."""
-    if not candidates:
-        return None
-    top = sorted(candidates, key=lambda x: x[0], reverse=True)[:top_n]
-    probs = [1.0 / o for o, _ in top if o > 1.0]
-    return mean(probs) if probs else None
+    return best_odds, fair_market_probs
