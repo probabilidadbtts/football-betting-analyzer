@@ -1,264 +1,230 @@
 """
-Motor de análisis principal.
-Combina Poisson + cuotas + filtros + Kelly.
-Se reestructuró la extracción/agregación de mercado para usar varios bookmakers
-y se añadió consumo mínimo de partidos recientes en filtros.
+Motor de análisis multi-mercado.
+Combina Poisson/Dixon-Coles + cuotas de mercado + contexto + Kelly.
+Devuelve lista de oportunidades rankeadas por edge real.
 """
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone
-from statistics import mean
+from typing import Any
+
 from .config import (
-    PROB_THRESHOLD_SINGLE, PROB_THRESHOLD_ACCA,
-    VALUE_MARGIN, MAX_BOOKMAKERS_AGG,
+    MARKETS, WEIGHT_POISSON, WEIGHT_MARKET, WEIGHT_FORM,
+    LEAGUE_AVG_GOALS, MIN_CONTEXT_SCORE,
 )
-from .poisson_model import p_btts, p_over_2_5, dixon_coles_correction
-from .filters import (
-    compute_team_metrics, compute_xg_metrics,
-    h2h_btts_rate, apply_filters,
+from .api_client import (
+    team_id_from_match, team_name_from_match, safe_score,
 )
-from .kelly import has_value, ev_percent, kelly_stake, breakeven_odds, classify_level
+from .models.poisson import compute_model_probs
+from .markets.extractor import extract_all_odds, best_odds, market_implied_prob
+from .markets.value import (
+    blend_probs, edge, expected_value_pct, kelly_stake,
+    has_value, classify_opportunity,
+)
+from .filters.context import (
+    compute_team_metrics, compute_xg_metrics, h2h_stats,
+    absence_impact, context_score, passes_hard_filters, rest_days,
+)
 
 log = logging.getLogger(__name__)
 
-FORM_BOOST = 0.05
-ABSENCE_PENALTY = 0.05
+
+def _extract_match_xg(st: dict) -> tuple[float | None, float | None]:
+    """Intenta sacar xG del partido actual (pre-match forecast o live)."""
+    if not st:
+        return None, None
+    home_xg = away_xg = None
+    if isinstance(st.get("home"), dict):
+        try:
+            home_xg = float(st["home"].get("xg"))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(st.get("away"), dict):
+        try:
+            away_xg = float(st["away"].get("xg"))
+        except (TypeError, ValueError):
+            pass
+    if home_xg is None or away_xg is None:
+        overview = st.get("overview") or {}
+        xg_block = (overview.get("expected_goals") or {}).get("all") or {}
+        if home_xg is None:
+            try:
+                home_xg = float(xg_block.get("home"))
+            except (TypeError, ValueError):
+                pass
+        if away_xg is None:
+            try:
+                away_xg = float(xg_block.get("away"))
+            except (TypeError, ValueError):
+                pass
+    return home_xg, away_xg
 
 
-def _f(v) -> float | None:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _d(v) -> dict:
-    """Devuelve dict garantizado (protege contra None)."""
-    return v if isinstance(v, dict) else {}
-
-
-def _l(v) -> list:
-    """Devuelve list garantizado (protege contra None)."""
-    return v if isinstance(v, list) else []
-
-
-def _extract_odds_value(odd) -> float | None:
-    """Extrae valor numérico de un campo de odds (puede ser str, dict o float)."""
-    if isinstance(odd, dict):
-        # intentar campos comunes
-        return _f(odd.get("last_seen") or odd.get("current") or odd.get("live") or odd.get("price"))
-    return _f(odd)
-
-
-def _aggregate_market_probability(bookmakers: list[dict], max_bookmakers: int = 3) -> tuple[float | None, float | None, str]:
-    """Agrega probabilidades implícitas de varios bookmakers.
-
-    - Extrae la cuota 'btts'->'yes' de cada bookmaker.
-    - Toma las mejores `max_bookmakers` en términos de cuota (mayor cuota = mejor para el apostador).
-    - Calcula p_market como el promedio simple de probabilidades implícitas (1/odds).
-    - Devuelve (p_market, best_odds, best_bookmaker)
+def analyze(
+    match: dict,
+    st: dict,
+    od: dict,
+    home_recent: list[dict],
+    away_recent: list[dict],
+    home_stats_cache: dict[str, dict],
+    away_stats_cache: dict[str, dict],
+    h2h_matches: list[dict] | None = None,
+    home_injuries: dict | None = None,
+    away_injuries: dict | None = None,
+    lineups_data: dict | None = None,
+) -> dict | None:
     """
-    if not bookmakers:
-        return None, None, ""
-
-    candidates: list[tuple[float, str]] = []  # (odds, bookmaker)
-    for bk in bookmakers:
-        if not isinstance(bk, dict):
-            continue
-        markets = _d(bk.get("markets"))
-        btts = _d(markets.get("btts"))
-        btts_yes = btts.get("yes")
-        val = _extract_odds_value(btts_yes)
-        if val and val > 1.0:
-            candidates.append((val, bk.get("bookmaker", "?")))
-
-    if not candidates:
-        return None, None, ""
-
-    # Ordenar por cuota descendente (mejor para apostador) y quedarse con top N
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top = candidates[:max_bookmakers]
-
-    odds_list = [o for o, _ in top]
-    prob_list = [1.0 / o for o in odds_list]
-
-    p_market = mean(prob_list) if prob_list else None
-    # Mejor cuota y su bookmaker (la primera en la lista ordenada)
-    best_odds, best_bk = top[0]
-    return p_market, best_odds, best_bk
-
-
-def _compute_form(recent_matches: list[dict], team_id: str) -> tuple[int, int, int]:
-    """(wins, draws, losses) en últimos partidos."""
-    wins = draws = losses = 0
-    for m in _l(recent_matches):
-        home_id = (_d(m.get("home_team"))).get("id")
-        away_id = (_d(m.get("away_team"))).get("id")
-        sh = _f((_d(m.get("home_team"))).get("score"))
-        sa = _f((_d(m.get("away_team"))).get("score"))
-        if sh is None or sa is None:
-            continue
-        if team_id == home_id:
-            if sh > sa:
-                wins += 1
-            elif sh == sa:
-                draws += 1
-            else:
-                losses += 1
-        elif team_id == away_id:
-            if sa > sh:
-                wins += 1
-            elif sa == sh:
-                draws += 1
-            else:
-                losses += 1
-    return wins, draws, losses
-
-
-def _check_absences(lineups_data: dict, players_list: list[dict], side: str) -> list[str]:
-    """Delanteros clave ausentes del XI."""
-    if not lineups_data or not players_list:
-        return []
-    side_data = _d(lineups_data.get(side))
-    xi = _l(side_data.get("starting_xi"))
-    subs = _l(side_data.get("substitutes"))
-    present_ids = {p.get("player_id") or p.get("id") for p in xi + subs}
-
-    forward_positions = {"ST", "CF", "LW", "RW", "FW"}
-    absent = []
-    for p in players_list:
-        pos = str(p.get("position", "")).upper()
-        if any(fp in pos for fp in forward_positions):
-            pid = p.get("id") or p.get("player_id")
-            if pid and pid not in present_ids:
-                absent.append(p.get("name", "?"))
-    return absent
-
-
-def analyze(match: dict,
-            st: dict,
-            od: dict,
-            home_recent: list[dict],
-            away_recent: list[dict],
-            home_stats_cache: dict[str, dict],
-            away_stats_cache: dict[str, dict],
-            h2h_matches: list[dict] | None = None,
-            lineups_data: dict | None = None,
-            home_players: list[dict] | None = None,
-            away_players: list[dict] | None = None,
-            ) -> dict | None:
+    Analiza un partido completo en todos los mercados configurados.
+    Retorna dict con info del partido, probs del modelo, lista de picks, etc.
     """
-    Analiza un partido completo. Devuelve dict con resultados o None.
-    """
-    # ═══ 0. EXTRAER NOMBRES (protegido) ═══
-    home = (_d(match.get("home_team"))).get("name", "Home")
-    away = (_d(match.get("away_team"))).get("name", "Away")
-    home_id = (_d(match.get("home_team"))).get("id", "")
-    away_id = (_d(match.get("away_team"))).get("id", "")
+    home = team_name_from_match(match, "home")
+    away = team_name_from_match(match, "away")
+    home_id = team_id_from_match(match, "home")
+    away_id = team_id_from_match(match, "away")
+    match_id = match.get("id", "")
 
-    # ═══ 1. xG DEL MATCH ═══
-    st = _d(st)
-    xg_h = _f(st.get("home", {}).get("xg")) or _f(
-        _d(_d(st.get("overview")).get("expected_goals")).get("all", {}).get("home")
-    ) if isinstance(st.get("overview"), dict) else None
-    xg_a = _f(st.get("away", {}).get("xg")) or _f(
-        _d(_d(st.get("overview")).get("expected_goals")).get("all", {}).get("away")
-    ) if isinstance(st.get("overview"), dict) else None
-
-    # ═══ 2. MÉTRICAS DE EQUIPOS ═══
-    home_metrics = compute_team_metrics(home_recent, home_id)
-    away_metrics = compute_team_metrics(away_recent, away_id)
-
+    # ── Métricas de equipos ──
+    home_m = compute_team_metrics(home_recent, home_id)
+    away_m = compute_team_metrics(away_recent, away_id)
     home_xg_for, home_xg_against = compute_xg_metrics(home_recent, home_id, home_stats_cache)
     away_xg_for, away_xg_against = compute_xg_metrics(away_recent, away_id, away_stats_cache)
 
-    # ═══ 3. MODELO POISSON / DIXON-COLES ═══
-    lambda_home = (home_xg_for + away_xg_against) / 2.0
-    lambda_away = (away_xg_for + home_xg_against) / 2.0
+    if home_m:
+        home_xg_for = home_xg_for or home_m.get("goals_for_avg", 1.3)
+        home_xg_against = home_xg_against or home_m.get("goals_against_avg", 1.3)
+    if away_m:
+        away_xg_for = away_xg_for or away_m.get("goals_for_avg", 1.3)
+        away_xg_against = away_xg_against or away_m.get("goals_against_avg", 1.3)
 
-    if xg_h is not None and xg_a is not None:
-        lambda_home = (lambda_home + xg_h) / 2.0
-        lambda_away = (lambda_away + xg_a) / 2.0
+    match_xg_h, match_xg_a = _extract_match_xg(st or {})
 
-    p_poisson = p_btts(lambda_home, lambda_away)
-    p_poisson_dc = dixon_coles_correction(p_poisson, lambda_home, lambda_away, rho=-0.1)
-
-    # ═══ 4. CUOTAS DE MERCADO (AGREGADAS) ═══
-    od = _d(od)
-    bookmakers = _l(od.get("bookmakers"))
-
-    p_market, btts_odds, btts_bookmaker = _aggregate_market_probability(bookmakers, max_bookmakers=MAX_BOOKMAKERS_AGG)
-
-    # ═══ 5. AJUSTES: FORMA + AUSENCIAS ═══
-    form_boost = 0.0
-    h_w, _, _ = _compute_form(home_recent, home_id)
-    a_w, _, _ = _compute_form(away_recent, away_id)
-    if h_w >= 4 and home_xg_for >= 1.2:
-        form_boost = FORM_BOOST
-    elif a_w >= 4 and away_xg_for >= 1.2:
-        form_boost = FORM_BOOST
-
-    lineups_data = _d(lineups_data)
-    home_absent = _check_absences(_d(lineups_data.get("home")), _l(home_players))
-    away_absent = _check_absences(_d(lineups_data.get("away")), _l(away_players))
-    home_penalty = ABSENCE_PENALTY if home_absent else 0.0
-    away_penalty = ABSENCE_PENALTY if away_absent else 0.0
-
-    # ═══ 6. FILTROS ═══
-    current_date = datetime.now(timezone.utc)
-    h2h_btts = h2h_btts_rate(h2h_matches) if h2h_matches else None
-
-    filters_passed, filter_reasons = apply_filters(
-        home_metrics=home_metrics,
-        away_metrics=away_metrics,
-        home_xg_for=home_xg_for,
-        home_xg_against=home_xg_against,
-        away_xg_for=away_xg_for,
-        away_xg_against=away_xg_against,
-        h2h_btts=h2h_btts,
-        current_date=current_date,
+    # ── Modelo ──
+    model_probs, lambda_h, lambda_a = compute_model_probs(
+        home_xg_for, home_xg_against,
+        away_xg_for, away_xg_against,
+        match_xg_home=match_xg_h,
+        match_xg_away=match_xg_a,
+        league_avg=LEAGUE_AVG_GOALS / 2.0,
     )
 
-    # ═══ 7. PROBABILIDAD FINAL ═══
-    if p_market:
-        p_model = 0.5 * p_poisson_dc + 0.5 * p_market + form_boost - (home_penalty + away_penalty) / 2
-    else:
-        p_model = p_poisson_dc + form_boost - (home_penalty + away_penalty) / 2
-    p_model = min(0.99, max(0.01, p_model))
+    # ── Cuotas ──
+    all_odds = extract_all_odds(od or {})
+    if not any(all_odds.values()):
+        log.debug("Sin cuotas extraíbles: %s vs %s", home, away)
+        return None
 
-    # ═══ 8. VALUE + KELLY + NIVEL ═══
-    value_flag = has_value(p_model, btts_odds, VALUE_MARGIN) if btts_odds else False
-    ev = ev_percent(p_model, btts_odds) if btts_odds else 0.0
-    stake = kelly_stake(p_model, btts_odds) if btts_odds and value_flag else 0.0
-    level = classify_level(p_model, ev, value_flag)
+    # ── Ausencias ──
+    h_abs_count, h_abs_names = absence_impact(home_injuries or {})
+    a_abs_count, a_abs_names = absence_impact(away_injuries or {})
 
-    # ═══ 9. RESULTADO ═══
+    # ── H2H ──
+    h2h = h2h_stats(h2h_matches or [])
+
+    # ── Ajuste de forma ──
+    form_adj = 0.0
+    hw = home_m.get("wins", 0)
+    aw = away_m.get("wins", 0)
+    if hw >= 4 and home_xg_for >= 1.3:
+        form_adj += 0.03
+    if aw >= 4 and away_xg_for >= 1.3:
+        form_adj += 0.03
+    if h_abs_count >= 2:
+        form_adj -= 0.02
+    if a_abs_count >= 2:
+        form_adj -= 0.02
+
+    # ── Evaluar cada mercado ──
+    picks: list[dict] = []
+    for mkt_key, mkt_label in MARKETS.items():
+        candidates = all_odds.get(mkt_key) or []
+        if not candidates:
+            continue
+
+        best_od, best_bk = best_odds(candidates)
+        if not best_od:
+            continue
+
+        p_mkt = market_implied_prob(candidates, top_n=3)
+        p_pois = model_probs.get(mkt_key, 0.5)
+
+        p_final = blend_probs(
+            p_poisson=p_pois,
+            p_market=p_mkt,
+            form_adj=form_adj,
+            weight_poisson=WEIGHT_POISSON,
+            weight_market=WEIGHT_MARKET,
+            weight_form=WEIGHT_FORM,
+        )
+
+        ctx, ctx_reasons = context_score(
+            home_m, away_m,
+            home_xg_for, home_xg_against,
+            away_xg_for, away_xg_against,
+            h2h,
+            home_absences=h_abs_count,
+            away_absences=a_abs_count,
+            market_key=mkt_key,
+        )
+
+        e = edge(p_final, best_od)
+        ev = expected_value_pct(p_final, best_od)
+        value = has_value(p_final, best_od)
+        level = classify_opportunity(p_final, best_od, ctx)
+        stake = kelly_stake(p_final, best_od) if value else 0.0
+
+        hard_ok, hard_reasons = passes_hard_filters(home_m, away_m, ctx)
+
+        picks.append({
+            "market": mkt_key,
+            "market_label": mkt_label,
+            "odds": best_od,
+            "bookmaker": best_bk,
+            "p_poisson": round(p_pois, 4),
+            "p_market": round(p_mkt, 4) if p_mkt else None,
+            "p_model": round(p_final, 4),
+            "edge": round(e, 4),
+            "ev": round(ev, 2),
+            "value": value,
+            "level": level,
+            "stake": round(stake, 2),
+            "context_score": round(ctx, 1),
+            "context_reasons": ctx_reasons,
+            "hard_filters_ok": hard_ok,
+            "hard_reasons": hard_reasons,
+        })
+
+    value_picks = [
+        p for p in picks
+        if p["value"] and p["hard_filters_ok"] and p["level"] <= 2
+    ]
+    value_picks.sort(key=lambda x: (-x["level"] == 1, -x["edge"], -x["context_score"]))
+
     return {
+        "match_id": match_id,
         "home": home,
         "away": away,
         "home_id": home_id,
         "away_id": away_id,
-        "p_poisson": p_poisson,
-        "p_poisson_dc": p_poisson_dc,
-        "p_market": p_market,
-        "p_model": p_model,
-        "lambda_home": lambda_home,
-        "lambda_away": lambda_away,
-        "btts_odds": btts_odds,
-        "btts_bookmaker": btts_bookmaker,
-        "value": value_flag,
-        "ev": ev,
-        "stake": stake,
-        "level": level,
-        "filters_passed": filters_passed,
-        "filter_reasons": filter_reasons,
-        "form_boost": form_boost,
-        "home_penalty": home_penalty,
-        "away_penalty": away_penalty,
-        "home_absent": home_absent,
-        "away_absent": away_absent,
-        "home_btts_rate": home_metrics.get("btts_rate", 0),
-        "away_btts_rate": away_metrics.get("btts_rate", 0),
-        "home_xg_against": home_xg_against,
-        "away_xg_against": away_xg_against,
-        "h2h_btts": h2h_btts,
-    }
+        "utc_date": match.get("utc_date"),
+        "competition_id": match.get("competition_id"),
+        "lambda_home": round(lambda_h, 3),
+        "lambda_away": round(lambda_a, 3),
+        "home_xg_for": round(home_xg_for, 3),
+        "home_xg_against": round(home_xg_against, 3),
+        "away_xg_for": round(away_xg_for, 3),
+        "away_xg_against": round(away_xg_against, 3),
+        "home_btts_rate": round(home_m.get("btts_rate", 0), 3),
+        "away_btts_rate": round(away_m.get("btts_rate", 0), 3),
+        "home_cs_rate": round(home_m.get("clean_sheet_rate", 0), 3),
+        "away_cs_rate": round(away_m.get("clean_sheet_rate", 0), 3),
+        "h2h": h2h,
+        "home_absences": h_abs_count,
+        "away_absences": a_abs_count,
+        "home_absence_names": h_abs_names,
+        "away_absence_names": a_abs_names,
+        "all_picks": picks,
+        "value_picks": value_picks,
+        "best_pick": value_picks[0] if value_picks else None,
+        "has_value": len(value_picks) > 0,
+            }
