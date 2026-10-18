@@ -25,14 +25,10 @@ COMPETITION_IDS: list[str] = []
 # ─── Mercados a analizar ────────────────────────────────────────────
 MARKETS = {
     "btts_yes":        "BTTS Yes",
-    "btts_no":         "BTTS No",
     "over_25":         "Over 2.5",
-    "under_25":        "Under 2.5",
     "home_win":        "1 (Home)",
     "draw":            "X (Draw)",
     "away_win":        "2 (Away)",
-    "home_dnb":        "Home DNB",
-    "away_dnb":        "Away DNB",
     "dc_1x":           "1X",
     "dc_12":           "12",
     "dc_x2":           "X2",
