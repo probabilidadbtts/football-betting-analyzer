@@ -1,6 +1,5 @@
 """
-Cliente HTTP robusto para TheStatsAPI.
-Soporta form home/away específico, xG, lesiones + impacto (squad + market value).
+Cliente TheStatsAPI: form home/away, xG, lesiones y plantilla.
 """
 from __future__ import annotations
 
@@ -10,9 +9,7 @@ from typing import Any
 from datetime import datetime, timedelta, timezone
 import requests
 
-from .config import (
-    API_KEY, BASE_URL, PER_PAGE, TIMEOUT, MAX_RETRIES, RECENT_MATCHES_N,
-)
+from .config import API_KEY, BASE_URL, PER_PAGE, TIMEOUT, MAX_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -33,13 +30,11 @@ def _get(path: str, params: dict | None = None, retries: int = MAX_RETRIES) -> d
         try:
             r = requests.get(url, headers=_HEADERS, params=params or {}, timeout=TIMEOUT)
         except requests.exceptions.Timeout:
-            log.warning("Timeout en %s (intento %d/%d)", path, attempt + 1, retries)
             if attempt < retries - 1:
                 time.sleep(1.8 ** attempt)
                 continue
             return {}
-        except requests.exceptions.RequestException as e:
-            log.warning("Error de red en %s: %s", path, e)
+        except requests.exceptions.RequestException:
             if attempt < retries - 1:
                 time.sleep(1.5 ** attempt)
                 continue
@@ -47,28 +42,18 @@ def _get(path: str, params: dict | None = None, retries: int = MAX_RETRIES) -> d
 
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", min(30, 2 ** attempt + 1)))
-            log.warning("Rate limit 429 en %s. Esperando %ss", path, retry_after)
             time.sleep(retry_after)
             continue
-
         if r.status_code >= 500:
             time.sleep(1.6 ** attempt)
             continue
-
-        if r.status_code in (404, 409):
+        if r.status_code in (404, 409, 401):
             return {}
-
-        if r.status_code == 401:
-            log.error("API Key inválida o ausente (401)")
-            return {}
-
         try:
             r.raise_for_status()
             return r.json()
-        except Exception as e:
-            log.warning("Respuesta inválida en %s: %s", path, e)
+        except Exception:
             return {}
-
     return {}
 
 
@@ -84,7 +69,6 @@ def matches(
     date_to = date_to or date_from
     all_items: list[dict] = []
     page = 1
-
     while True:
         params: dict[str, Any] = {
             "date_from": date_from,
@@ -104,36 +88,31 @@ def matches(
         data = resp.get("data")
         meta = resp.get("meta") or {}
         total_pages = meta.get("total_pages", 1)
-
         if not isinstance(data, list) or not data:
             break
-
         all_items.extend(data)
         if page >= total_pages:
             break
         page += 1
-        if page % 3 == 0:
-            time.sleep(0.3)
-
+        if page % 4 == 0:
+            time.sleep(0.25)
     return all_items
 
 
 def team_finished_matches(team_id: str, n: int = 30) -> list[dict]:
-    """Partidos finalizados recientes de un equipo (cacheados)."""
     if not team_id:
         return []
     if team_id in _team_matches_cache:
         return _team_matches_cache[team_id][:n]
-
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=150)
+    start = end - timedelta(days=160)
     items = matches(
         date_from=start.isoformat(),
         date_to=end.isoformat(),
         status="finished",
         team_id=team_id,
         sort="-utc_date",
-        per_page=40,
+        per_page=50,
     )
     items = sorted(items, key=lambda m: m.get("utc_date") or "", reverse=True)
     _team_matches_cache[team_id] = items
@@ -141,29 +120,27 @@ def team_finished_matches(team_id: str, n: int = 30) -> list[dict]:
 
 
 def team_home_matches(team_id: str, n: int = 5) -> list[dict]:
-    """Últimos N partidos del equipo jugando como LOCAL."""
-    all_m = team_finished_matches(team_id, n=25)
-    home = []
+    """Últimos N partidos del equipo como LOCAL."""
+    all_m = team_finished_matches(team_id, n=30)
+    out = []
     for m in all_m:
-        hid = team_id_from_match(m, "home")
-        if hid == team_id:
-            home.append(m)
-            if len(home) >= n:
+        if team_id_from_match(m, "home") == team_id:
+            out.append(m)
+            if len(out) >= n:
                 break
-    return home
+    return out
 
 
 def team_away_matches(team_id: str, n: int = 5) -> list[dict]:
-    """Últimos N partidos del equipo jugando como VISITANTE."""
-    all_m = team_finished_matches(team_id, n=25)
-    away = []
+    """Últimos N partidos del equipo como VISITANTE."""
+    all_m = team_finished_matches(team_id, n=30)
+    out = []
     for m in all_m:
-        aid = team_id_from_match(m, "away")
-        if aid == team_id:
-            away.append(m)
-            if len(away) >= n:
+        if team_id_from_match(m, "away") == team_id:
+            out.append(m)
+            if len(out) >= n:
                 break
-    return away
+    return out
 
 
 def match_stats(match_id: str) -> dict:
@@ -179,30 +156,25 @@ def match_stats(match_id: str) -> dict:
 
 
 def match_live_stats(match_id: str) -> dict:
-    resp = _get(f"/football/matches/{match_id}/live-stats")
-    return resp.get("data") or {}
+    return (_get(f"/football/matches/{match_id}/live-stats") or {}).get("data") or {}
 
 
 def match_odds(match_id: str) -> dict:
-    resp = _get(f"/football/matches/{match_id}/odds")
-    return resp.get("data") or {}
+    return (_get(f"/football/matches/{match_id}/odds") or {}).get("data") or {}
 
 
 def match_odds_live(match_id: str) -> dict:
-    resp = _get(f"/football/matches/{match_id}/odds/live")
-    return resp.get("data") or {}
+    return (_get(f"/football/matches/{match_id}/odds/live") or {}).get("data") or {}
 
 
 def team_injuries_suspensions(team_id: str, current: bool = True) -> dict:
     if not team_id:
         return {}
-    params = {"current": str(current).lower()}
-    resp = _get(f"/football/teams/{team_id}/injuries-suspensions", params)
+    resp = _get(f"/football/teams/{team_id}/injuries-suspensions", {"current": str(current).lower()})
     return resp.get("data") or {}
 
 
 def team_squad(team_id: str) -> list[dict]:
-    """Plantilla del equipo (incluye market_value y position)."""
     if not team_id:
         return []
     if team_id in _squad_cache:
@@ -261,9 +233,6 @@ def extract_live_match_state(match: dict, live_stats: dict) -> tuple[int, int, i
             break
     if minute <= 0:
         minute = 45
-
     sh = safe_score(match, "home")
     sa = safe_score(match, "away")
-    h_goals = int(sh) if sh is not None else 0
-    a_goals = int(sa) if sa is not None else 0
-    return max(0, min(95, minute)), h_goals, a_goals
+    return max(0, min(95, minute)), int(sh or 0), int(sa or 0)
