@@ -1,5 +1,6 @@
 """
 Configuración central del analizador cuantitativo de value betting.
+Enfocado en fiabilidad (pocos falsos positivos) y protección de bankroll.
 """
 from __future__ import annotations
 
@@ -11,15 +12,25 @@ load_dotenv()
 # --- TheStatsAPI ---
 API_KEY: str = os.getenv("THESTATSAPI_API_KEY", "")
 BASE_URL: str = "https://api.thestatsapi.com/api"
-TIMEOUT: int = 15
+TIMEOUT: int = 18
 PER_PAGE: int = 100
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 4
 
 # --- Telegram ---
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Competiciones (vacío = todas las que tengan cuotas)
+# Competiciones
+# Vacío = analizar TODAS las ligas del día (recomendado para cobertura máxima)
+# Si rellenas COMPETITION_IDS, solo se analizan esas.
+# TOP_COMPETITION_IDS queda como lista de referencia opcional.
+TOP_COMPETITION_IDS: list[str] = [
+    "comp_3039",   # Premier League (ENG)
+    "comp_8814",   # LaLiga
+    "comp_5840",   # Serie A
+]
+
+# Vacío = TODAS las ligas. Rellena solo si quieres filtrar.
 COMPETITION_IDS: list[str] = []
 
 # --- Mercados Analizados ---
@@ -38,33 +49,43 @@ MARKETS = {
     "away_dnb": "DNB 2",
 }
 
-SHARP_BOOKMAKERS = ["pinnacle", "betfair-exchange", "betfair"]
+# Bookmakers sharp (peso extra al calcular fair probability)
+SHARP_BOOKMAKERS = ["pinnacle", "betfair-exchange", "betfair", "sbobet", "matchbook"]
 
 # --- Parámetros del Modelo Matemático ---
-POISSON_MAX_GOALS: int = 9
-HOME_ADVANTAGE_FACTOR: float = 1.10   # +10% de ventaja ofensiva local promedio
-DIXON_COLES_RHO: float = -0.06        # Correlación empírica para bajas puntuaciones (0-0, 1-0, 0-1, 1-1)
-DEFAULT_LEAGUE_AVG_GOALS: float = 2.65
+POISSON_MAX_GOALS: int = 10
+HOME_ADVANTAGE_FACTOR: float = 1.12          # +12% ventaja ofensiva local (ligeramente más realista)
+DIXON_COLES_RHO: float = -0.05              # Correlación empírica baja-puntuación
+DEFAULT_LEAGUE_AVG_GOALS: float = 2.70
 
-# Pesos del ensamble Bayesiano (Modelo vs Mercado desmargenado)
-WEIGHT_MODEL: float = 0.45
-WEIGHT_MARKET: float = 0.55
+# Pesos del ensamble (Modelo vs Mercado desmargenado)
+# Más peso al mercado = más conservador (menos overfit del modelo)
+WEIGHT_MODEL: float = 0.40
+WEIGHT_MARKET: float = 0.60
 
-# --- Filtros de Valor y Kelly Criterion ---
-MIN_EDGE: float = 0.025               # Mínimo 2.5% de ventaja real
-MIN_EV_PERCENT: float = 3.0           # Mínimo +3.0% de Valor Esperado
-KELLY_FRACTION: float = 0.08          # Criterio de Kelly fraccional conservador (1/12 Kelly)
+# --- Filtros de Valor y Kelly (más estrictos = más fiables) ---
+MIN_EDGE: float = 0.030                     # Mínimo 3.0% edge real
+MIN_EV_PERCENT: float = 3.5                 # Mínimo +3.5% EV
+KELLY_FRACTION: float = 0.06                # ~1/16 Kelly (muy conservador)
 BANKROLL_UNITS: float = 100.0
-MAX_STAKE_UNITS: float = 2.0          # Máximo 2% del bankroll por selección
+MAX_STAKE_UNITS: float = 1.5                # Máximo 1.5% del bankroll por pick
 
-# --- Niveles de Convicción ---
-LEVEL1_EDGE: float = 0.055
-LEVEL1_CONTEXT: float = 62.0
-LEVEL2_EDGE: float = 0.025
-LEVEL2_CONTEXT: float = 48.0
-MIN_CONTEXT_SCORE: float = 40.0
+# --- Niveles de Convicción (más exigentes) ---
+LEVEL1_EDGE: float = 0.065
+LEVEL1_CONTEXT: float = 68.0
+LEVEL2_EDGE: float = 0.030
+LEVEL2_CONTEXT: float = 55.0
+MIN_CONTEXT_SCORE: float = 48.0
 
 # --- Concurrencia y Datos ---
-MAX_WORKERS: int = 8
-MAX_MATCHES: int = 150
-RECENT_MATCHES_N: int = 15
+MAX_WORKERS: int = 6
+MAX_MATCHES: int = 200                      # Tope de partidos a intentar analizar
+RECENT_MATCHES_N: int = 12
+MIN_MATCHES_FOR_RATING: int = 5
+
+# Parar el workflow cuando se encuentren N partidos con valor
+TARGET_VALUE_MATCHES: int = 20
+
+# Guardar picks para análisis posterior
+SAVE_PICKS_JSON: bool = True
+PICKS_DIR: str = "picks"
