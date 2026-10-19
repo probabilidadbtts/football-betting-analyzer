@@ -1,7 +1,6 @@
 """
-Pre-match: analiza todos los partidos del día con cuotas.
-Predicción basada en xG de los últimos 5 como local (local) y 5 como visitante (visitante).
-Sin tope de 20.
+Pre-match: solo ligas reconocidas + sin juveniles/U21/reservas.
+Predicción con xG de últimos 5 home del local y 5 away del visitante.
 """
 from __future__ import annotations
 
@@ -11,12 +10,15 @@ from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from src.config import COMPETITION_IDS, MAX_MATCHES, MAX_WORKERS, SAVE_PICKS_JSON, PICKS_DIR
+from src.config import (
+    COMPETITION_IDS, TOP_COMPETITION_IDS, MAX_MATCHES, MAX_WORKERS,
+    SAVE_PICKS_JSON, PICKS_DIR, YOUTH_KEYWORDS,
+)
 from src.api_client import (
     matches, match_odds,
     team_home_matches, team_away_matches,
     team_injuries_suspensions, team_squad,
-    team_id_from_match,
+    team_id_from_match, team_name_from_match,
 )
 from src.analyzer import analyze_match
 from src.telegram_bot import send_report
@@ -25,10 +27,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 
+def _is_youth_team(name: str) -> bool:
+    if not name:
+        return False
+    lower = f" {name.lower()} "
+    return any(kw in lower for kw in YOUTH_KEYWORDS)
+
+
+def _get_competitions() -> list[str]:
+    if COMPETITION_IDS:
+        return COMPETITION_IDS
+    return TOP_COMPETITION_IDS
+
+
 def _process_single(m: dict) -> dict | None:
     mid = m.get("id")
     if not mid:
         return None
+
+    home = team_name_from_match(m, "home")
+    away = team_name_from_match(m, "away")
+
+    # Descartar juveniles / U21 / reservas
+    if _is_youth_team(home) or _is_youth_team(away):
+        log.debug("Descartado (juvenil): %s vs %s", home, away)
+        return None
+
     try:
         od = match_odds(mid)
         if not od or not od.get("bookmakers"):
@@ -37,7 +61,6 @@ def _process_single(m: dict) -> dict | None:
         hid = team_id_from_match(m, "home")
         aid = team_id_from_match(m, "away")
 
-        # Form específico + xG
         h_home = team_home_matches(hid, n=5)
         a_away = team_away_matches(aid, n=5)
 
@@ -70,14 +93,21 @@ def _process_single(m: dict) -> dict | None:
 
 def main():
     today = date.today().isoformat()
-    log.info("Pre-Match (predicción con xG home/away + bajas) — %s", today)
+    log.info("Pre-Match (ligas reconocidas, sin juveniles) — %s", today)
 
-    pool = []
-    if COMPETITION_IDS:
-        for cid in COMPETITION_IDS:
-            pool.extend(matches(date_from=today, date_to=today, status="scheduled", competition_id=cid))
+    comps = _get_competitions()
+    pool: list[dict] = []
+
+    if comps:
+        for cid in comps:
+            pool.extend(
+                matches(date_from=today, date_to=today, status="scheduled", competition_id=cid)
+            )
+        log.info("Competiciones filtradas: %d", len(comps))
     else:
+        # Si no hay lista, analiza todas pero luego filtra juveniles
         pool = matches(date_from=today, date_to=today, status="scheduled")
+        log.info("Sin filtro de competición (todas las ligas), se eliminarán juveniles")
 
     seen, unique = set(), []
     for m in pool:
@@ -87,10 +117,7 @@ def main():
             unique.append(m)
 
     eligible = [m for m in unique if m.get("odds_available")]
-    log.info("Partidos con cuotas: %d", len(eligible))
-    if not eligible:
-        send_report([], f"PRE-MATCH {today}", 0)
-        return
+    log.info("Partidos con cuotas (antes de filtrar juveniles): %d", len(eligible))
 
     candidates = eligible[:MAX_MATCHES]
     results, value_matches = [], []
@@ -104,11 +131,9 @@ def main():
                 if res.get("has_value"):
                     value_matches.append(res)
                     log.info(
-                        "✓ %s vs %s | xG-matches H:%s A:%s | xG-for H:%.2f A:%.2f | bajas H:%.0f A:%.0f | picks:%d",
+                        "✓ %s vs %s | xG H:%s A:%s | picks:%d",
                         res.get("home"), res.get("away"),
                         res.get("home_xg_matches"), res.get("away_xg_matches"),
-                        res.get("home_avg_xg_for") or 0, res.get("away_avg_xg_for") or 0,
-                        res.get("home_injury_impact") or 0, res.get("away_injury_impact") or 0,
                         len(res.get("value_picks") or []),
                     )
 
