@@ -1,6 +1,6 @@
 """
 Configuración central del analizador cuantitativo de value betting.
-Enfocado en fiabilidad (pocos falsos positivos) y protección de bankroll.
+Solo ligas reconocidas + sin juveniles/U21. Predicción basada en xG real.
 """
 from __future__ import annotations
 
@@ -20,18 +20,35 @@ MAX_RETRIES: int = 4
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Competiciones
-# Vacío = analizar TODAS las ligas del día (recomendado para cobertura máxima)
-# Si rellenas COMPETITION_IDS, solo se analizan esas.
-# TOP_COMPETITION_IDS queda como lista de referencia opcional.
+# --- Competiciones reconocidas ---
+# Si COMPETITION_IDS está vacío se usan TOP_COMPETITION_IDS.
+# Rellena más IDs con: GET /football/competitions?search=Bundesliga
 TOP_COMPETITION_IDS: list[str] = [
-    "comp_3039",   # Premier League (ENG)
+    "comp_3039",   # Premier League
     "comp_8814",   # LaLiga
     "comp_5840",   # Serie A
+    # Añade aquí más ligas reconocidas:
+    # "comp_XXXX", # Bundesliga
+    # "comp_XXXX", # Ligue 1
+    # "comp_XXXX", # Eredivisie
+    # "comp_XXXX", # Championship
+    # "comp_XXXX", # Segunda División
+    # "comp_XXXX", # Serie B
+    # "comp_XXXX", # 2. Bundesliga
+    # "comp_XXXX", # Champions League
+    # "comp_XXXX", # Europa League
 ]
 
-# Vacío = TODAS las ligas. Rellena solo si quieres filtrar.
+# Vacío = usa TOP_COMPETITION_IDS. Si tiene valores, solo analiza esas.
 COMPETITION_IDS: list[str] = []
+
+# Palabras que identifican juveniles / reservas / U21 (se descartan)
+YOUTH_KEYWORDS: list[str] = [
+    "jong ", "u19", "u-19", "u21", "u-21", "u23", "u-23",
+    "youth", "junior", "juvenil", "reserve", "reserves",
+    " ii", " iii", " b ", " b)", "(b)", "amateurs",
+    "academy", "under 19", "under 21", "under 23",
+]
 
 # --- Mercados Analizados ---
 MARKETS = {
@@ -54,23 +71,22 @@ SHARP_BOOKMAKERS = ["pinnacle", "betfair-exchange", "betfair", "sbobet", "matchb
 
 # --- Parámetros del Modelo Matemático ---
 POISSON_MAX_GOALS: int = 10
-HOME_ADVANTAGE_FACTOR: float = 1.12          # +12% ventaja ofensiva local (ligeramente más realista)
-DIXON_COLES_RHO: float = -0.05              # Correlación empírica baja-puntuación
+HOME_ADVANTAGE_FACTOR: float = 1.12
+DIXON_COLES_RHO: float = -0.05
 DEFAULT_LEAGUE_AVG_GOALS: float = 2.70
 
 # Pesos del ensamble (Modelo vs Mercado desmargenado)
-# Más peso al mercado = más conservador (menos overfit del modelo)
 WEIGHT_MODEL: float = 0.40
 WEIGHT_MARKET: float = 0.60
 
-# --- Filtros de Valor y Kelly (más estrictos = más fiables) ---
-MIN_EDGE: float = 0.030                     # Mínimo 3.0% edge real
-MIN_EV_PERCENT: float = 3.5                 # Mínimo +3.5% EV
-KELLY_FRACTION: float = 0.06                # ~1/16 Kelly (muy conservador)
+# --- Filtros de Valor y Kelly ---
+MIN_EDGE: float = 0.030
+MIN_EV_PERCENT: float = 3.5
+KELLY_FRACTION: float = 0.06
 BANKROLL_UNITS: float = 100.0
-MAX_STAKE_UNITS: float = 1.5                # Máximo 1.5% del bankroll por pick
+MAX_STAKE_UNITS: float = 1.5
 
-# --- Niveles de Convicción (más exigentes) ---
+# --- Niveles de Convicción ---
 LEVEL1_EDGE: float = 0.065
 LEVEL1_CONTEXT: float = 68.0
 LEVEL2_EDGE: float = 0.030
@@ -79,12 +95,9 @@ MIN_CONTEXT_SCORE: float = 48.0
 
 # --- Concurrencia y Datos ---
 MAX_WORKERS: int = 6
-MAX_MATCHES: int = 200                      # Tope de partidos a intentar analizar
+MAX_MATCHES: int = 200
 RECENT_MATCHES_N: int = 12
-MIN_MATCHES_FOR_RATING: int = 5
-
-# Parar el workflow cuando se encuentren N partidos con valor
-TARGET_VALUE_MATCHES: int = 20
+MIN_MATCHES_FOR_RATING: int = 4          # Mínimo de partidos con xG real por lado
 
 # Guardar picks para análisis posterior
 SAVE_PICKS_JSON: bool = True
