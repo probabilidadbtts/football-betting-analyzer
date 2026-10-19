@@ -1,22 +1,25 @@
 """
-Orquestador pre-match: analiza TODOS los partidos del día (cualquier liga)
-y finaliza el workflow en cuanto encuentra TARGET_VALUE_MATCHES partidos con valor.
+Pre-match: solo partidos con historial xG.
+Form: últimos 5 del local como local + últimos 5 del visitante como visitante.
+Incluye impacto de bajas (market_value + posición).
+Para al llegar a TARGET_VALUE_MATCHES.
 """
 from __future__ import annotations
 
 import json
 import logging
 from datetime import date
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 from src.config import (
     COMPETITION_IDS, MAX_MATCHES, MAX_WORKERS,
-    RECENT_MATCHES_N, SAVE_PICKS_JSON, PICKS_DIR, TARGET_VALUE_MATCHES,
+    SAVE_PICKS_JSON, PICKS_DIR, TARGET_VALUE_MATCHES,
 )
 from src.api_client import (
-    matches, match_stats, match_odds,
-    team_recent_matches, team_injuries_suspensions,
+    matches, match_odds,
+    team_home_matches, team_away_matches,
+    team_injuries_suspensions, team_squad,
     team_id_from_match,
 )
 from src.analyzer import analyze_match
@@ -26,23 +29,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 
-def _fetch_context(team_id: str) -> tuple[list[dict], dict[str, dict], dict]:
-    if not team_id:
-        return [], {}, {}
-    recent = team_recent_matches(team_id, RECENT_MATCHES_N)
-    stats_cache: dict[str, dict] = {}
-    for m in recent[:5]:
-        mid = m.get("id")
-        if mid and m.get("xg_available"):
-            stats_cache[mid] = match_stats(mid)
-    injuries = team_injuries_suspensions(team_id, current=True)
-    return recent, stats_cache, injuries
-
-
 def _process_single(m: dict) -> dict | None:
     mid = m.get("id")
     if not mid:
         return None
+
+    # Solo partidos que tienen flag xG
+    if not m.get("xg_available"):
+        return None
+
     try:
         od = match_odds(mid)
         if not od or not od.get("bookmakers"):
@@ -51,28 +46,36 @@ def _process_single(m: dict) -> dict | None:
         hid = team_id_from_match(m, "home")
         aid = team_id_from_match(m, "away")
 
-        h_rec, h_cache, h_inj = _fetch_context(hid)
-        a_rec, a_cache, a_inj = _fetch_context(aid)
+        # Form específico de lado (5 partidos)
+        h_home = team_home_matches(hid, n=5)
+        a_away = team_away_matches(aid, n=5)
 
+        # Lesiones + plantilla para impacto
+        h_inj = team_injuries_suspensions(hid, current=True)
+        a_inj = team_injuries_suspensions(aid, current=True)
+        h_squad = team_squad(hid)
+        a_squad = team_squad(aid)
+
+        # H2H simple (desde los home del local)
         h2h = [
-            rm for rm in h_rec
+            rm for rm in h_home
             if team_id_from_match(rm, "home") == aid or team_id_from_match(rm, "away") == aid
         ]
 
         return analyze_match(
             match=m,
             odds_payload=od,
-            home_recent=h_rec,
-            away_recent=a_rec,
-            home_stats_cache=h_cache,
-            away_stats_cache=a_cache,
-            h2h_matches=h2h,
+            home_home_matches=h_home,
+            away_away_matches=a_away,
             home_injuries=h_inj,
             away_injuries=a_inj,
+            home_squad=h_squad,
+            away_squad=a_squad,
+            h2h_matches=h2h,
             is_live=False,
         )
     except Exception as e:
-        log.warning("Error procesando partido %s: %s", mid, e)
+        log.warning("Error procesando %s: %s", mid, e)
         return None
 
 
@@ -82,14 +85,13 @@ def _save_picks(results: list[dict], title: str) -> None:
     try:
         Path(PICKS_DIR).mkdir(parents=True, exist_ok=True)
         fname = f"{PICKS_DIR}/prematch_{date.today().isoformat()}.json"
-        payload = {
-            "title": title,
-            "generated_at": date.today().isoformat(),
-            "matches_with_value": len([r for r in results if r.get("has_value")]),
-            "matches": results,
-        }
         with open(fname, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+            json.dump({
+                "title": title,
+                "generated_at": date.today().isoformat(),
+                "matches_with_value": len(results),
+                "matches": results,
+            }, f, ensure_ascii=False, indent=2, default=str)
         log.info("Picks guardados en %s", fname)
     except Exception as e:
         log.warning("No se pudieron guardar picks: %s", e)
@@ -97,10 +99,9 @@ def _save_picks(results: list[dict], title: str) -> None:
 
 def main():
     today = date.today().isoformat()
-    log.info("Iniciando Value Finder Pre-Match (TODAS las ligas) — %s", today)
-    log.info("Objetivo: encontrar hasta %d partidos con valor y finalizar", TARGET_VALUE_MATCHES)
+    log.info("Pre-Match (solo xG + form home/away + bajas) — %s", today)
+    log.info("Objetivo: %d partidos con valor", TARGET_VALUE_MATCHES)
 
-    # --- Obtener partidos del día (todas las ligas si COMPETITION_IDS vacío) ---
     pool_matches: list[dict] = []
     if COMPETITION_IDS:
         for cid in COMPETITION_IDS:
@@ -108,10 +109,8 @@ def main():
                 matches(date_from=today, date_to=today, status="scheduled", competition_id=cid)
             )
     else:
-        # Sin filtro de competición → todas las ligas
         pool_matches = matches(date_from=today, date_to=today, status="scheduled")
 
-    # Deduplicar
     seen = set()
     unique = []
     for m in pool_matches:
@@ -120,24 +119,18 @@ def main():
             seen.add(mid)
             unique.append(m)
 
-    eligible = [m for m in unique if m.get("odds_available")]
-    log.info("Partidos programados con cuotas hoy: %d (todas las ligas)", len(eligible))
+    # Solo con odds y con flag xG
+    eligible = [m for m in unique if m.get("odds_available") and m.get("xg_available")]
+    log.info("Partidos con cuotas + xG disponible: %d", len(eligible))
 
     if not eligible:
-        log.info("No hay partidos con cuotas disponibles.")
         send_report([], f"PRE-MATCH {today}", 0)
         return
 
-    # Limitar el pool máximo a analizar
     candidates = eligible[:MAX_MATCHES]
-    log.info("Se intentarán analizar hasta %d partidos (parada anticipada a %d con valor)",
-             len(candidates), TARGET_VALUE_MATCHES)
-
-    results: list[dict] = []
     value_matches: list[dict] = []
     analyzed = 0
 
-    # Procesamiento con parada anticipada
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_process_single, m): m for m in candidates}
         pending = set(futures.keys())
@@ -147,30 +140,21 @@ def main():
             for fut in done:
                 analyzed += 1
                 res = fut.result()
-                if res:
-                    results.append(res)
-                    if res.get("has_value"):
-                        value_matches.append(res)
-                        log.info(
-                            "✓ Valor encontrado (%d/%d): %s vs %s — %d picks",
-                            len(value_matches), TARGET_VALUE_MATCHES,
-                            res.get("home"), res.get("away"),
-                            len(res.get("value_picks") or []),
-                        )
+                if res and res.get("has_value"):
+                    value_matches.append(res)
+                    log.info("✓ Valor (%d/%d): %s vs %s | xG H:%s A:%s | Impacto bajas H:%.0f A:%.0f",
+                             len(value_matches), TARGET_VALUE_MATCHES,
+                             res.get("home"), res.get("away"),
+                             res.get("home_xg_matches"), res.get("away_xg_matches"),
+                             res.get("home_injury_impact", 0), res.get("away_injury_impact", 0))
 
                 if len(value_matches) >= TARGET_VALUE_MATCHES:
-                    # Cancelar el resto de futuros pendientes
                     for p in pending:
                         p.cancel()
-                    log.info("🎯 Objetivo de %d partidos con valor alcanzado. Finalizando workflow.", TARGET_VALUE_MATCHES)
+                    log.info("🎯 Objetivo alcanzado. Finalizando.")
                     break
 
-    log.info(
-        "Resumen PRE-MATCH: analizados=%d | con valor=%d | objetivo=%d",
-        analyzed, len(value_matches), TARGET_VALUE_MATCHES,
-    )
-
-    # Enviar solo los que tienen valor
+    log.info("Resumen: analizados=%d | con valor=%d", analyzed, len(value_matches))
     _save_picks(value_matches, f"PRE-MATCH {today}")
     send_report(value_matches, f"PRE-MATCH {today}", analyzed)
 
