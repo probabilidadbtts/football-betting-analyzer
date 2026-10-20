@@ -2,12 +2,11 @@ workflows:
   python-android-apk:
     name: Build Python Android APK
     max_build_duration: 60
-    instance_type: linux_x2
+    instance_type: mac_mini_m1
     scripts:
       - name: Install System Dependencies & Buildozer
         script: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libreadline-dev libsqlite3-dev libgdbm-dev libssl-dev libffi-dev liblzma-dev build-essential ccache libltdl-dev
+          brew install autoconf libtool pkg-config
           pip3 install --upgrade pip
           pip3 install buildozer cython==0.29.33
       - name: Build Android APK
