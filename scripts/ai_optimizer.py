@@ -1,15 +1,13 @@
 import os
-import google.generativeai as genai
+from google import genai
 
 # Configurar la API Key desde los secretos de GitHub Actions
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("No se encontró la GEMINI_API_KEY en el entorno.")
 
-genai.configure(api_key=api_key)
-
-# Usar Gemini 3.8 Flash para la optimización de código
-model = genai.GenerativeModel('gemini-3.8-flash')
+# Inicializar el cliente oficial con la nueva librería google-genai
+client = genai.Client(api_key=api_key)
 
 # Archivos críticos de tu sistema de inversión que la IA va a optimizar
 files_to_optimize = [
@@ -36,7 +34,11 @@ for filepath in files_to_optimize:
         
         prompt = f"{system_instruction}\n\nCódigo actual del archivo `{filepath}`:\n```python\n{content}\n```\nEntraga la versión mejorada completa."
         
-        response = model.generate_content(prompt)
+        # Nueva sintaxis de llamada para Gemini 3.8 Flash con google-genai
+        response = client.models.generate_content(
+            model='gemini-3.8-flash',
+            contents=prompt,
+        )
         optimized_code = response.text
         
         # Limpiar etiquetas de Markdown si el modelo las incluye en la respuesta
